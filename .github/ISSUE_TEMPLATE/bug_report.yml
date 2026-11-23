@@ -1,0 +1,120 @@
+name: Bug Report
+description: Report a bug or issue with minato
+title: "[BUG] "
+labels: ["bug", "needs-triage"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please provide as much detail as possible.
+
+        **Never paste secrets, tokens or credentials into an issue.**
+
+  - type: input
+    id: version
+    attributes:
+      label: minato Version
+      description: Output of `go list -m github.com/swiftly-headquarters/minato`, the release tag, or the commit hash you built.
+      placeholder: e.g., v1.0.0, or 13d759c
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go Version
+      description: Output of `go version`.
+      placeholder: e.g., go1.27.4 linux/amd64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of minato is affected?
+      options:
+        - Server library (handlers, binding, validation, errors)
+        - OpenAPI spec generation
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: What operating system are you using?
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+
+  - type: textarea
+    id: code
+    attributes:
+      label: Handler / Route Code
+      description: The smallest handler, input/output types and registration call that reproduce the problem.
+      render: go
+      placeholder: |
+        server.Get(api, "/users/{id}", getUser)
+        type Input struct {
+            ID int `path:"id"`
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior
+      placeholder: |
+        1. Register the handler above
+        2. Call 'curl ...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: A clear and concise description of what actually happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs/Console Output
+      description: If applicable, add the HTTP response, or server log.
+      render: text
+      placeholder: Paste your logs here...
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Add any other context about the problem here.
