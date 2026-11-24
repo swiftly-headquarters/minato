@@ -120,6 +120,11 @@ func (a *API) document(op Operation, in *input, out *output) {
 			d.Responses["422"] = &ResponseDoc{Description: http.StatusText(http.StatusUnprocessableEntity), Content: problem}
 		}
 	}
+	if len(op.Security) > 0 {
+		if _, taken := d.Responses["401"]; !taken {
+			d.Responses["401"] = &ResponseDoc{Description: http.StatusText(http.StatusUnauthorized), Content: problem}
+		}
+	}
 	for _, code := range op.Errors {
 		d.Responses[strconv.Itoa(code)] = &ResponseDoc{Description: http.StatusText(code), Content: problem}
 	}

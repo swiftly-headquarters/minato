@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/swiftly-headquarters/minato/server"
 )
 
 type Check func(ctx context.Context) error
@@ -26,6 +28,17 @@ func writeHealth(w http.ResponseWriter, code int, h health) {
 func Live() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeHealth(w, http.StatusOK, health{Status: "ok"})
+	})
+}
+
+func ReadyFor(a *server.API, timeout time.Duration, checks map[string]Check) http.Handler {
+	ready := Ready(timeout, checks)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.Draining() {
+			writeHealth(w, http.StatusServiceUnavailable, health{Status: "draining"})
+			return
+		}
+		ready.ServeHTTP(w, r)
 	})
 }
 

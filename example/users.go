@@ -55,15 +55,22 @@ func patchUser(ctx context.Context, in *PatchInput) (*GetOutput, error) {
 }
 
 type ListInput struct {
-	Limit int `query:"limit" default:"20" minimum:"1" maximum:"100"`
+	server.Page
 }
 
 type ListOutput struct {
-	Body []store.User
+	Body server.PageBody[store.User]
 }
 
 func listUsers(ctx context.Context, in *ListInput) (*ListOutput, error) {
-	return &ListOutput{Body: store.List(in.Limit)}, nil
+	after := 0
+	if in.Cursor != "" {
+		if err := server.DecodeCursor(in.Cursor, &after); err != nil {
+			return nil, server.InvalidCursor(err)
+		}
+	}
+	rows := store.List(after, in.Limit+1)
+	return &ListOutput{Body: server.Paginate(rows, in.Limit, func(u store.User) any { return u.ID })}, nil
 }
 
 type CreateInput struct {

@@ -203,11 +203,34 @@ server.Handle(api, "/", h)
 ## Security
 
 ```go
-api.BearerAuth("bearer")                       // declares the scheme in the spec
-admin.Security = server.Secured("bearer")      // or o.Security = server.Secured("oauth", "read") on one operation; an operation's own value replaces the group's
+api.AddScheme("bearer", server.Scheme{
+	Spec:      map[string]any{"type": "http", "scheme": "bearer"},
+	Challenge: "Bearer",
+	Verify: func(ctx context.Context, r *http.Request, scopes []string) (context.Context, error) {
+		token, ok := server.BearerToken(r)
+		if !ok { return nil, errors.New("missing token") }
+		// return a context for the handler, or an error
+		return ctx, nil
+	},
+})
+admin.Security = server.Secured("bearer")      // or o.Security = server.Secured("bearer", "admin") for scopes on one operation; an operation's own value replaces the group's
 ```
 
-This is documentation only. minato never checks credentials: enforce them with `middleware.Bearer` (see above) or your own middleware. An operation cannot opt out of `Spec.Security` set globally.
+- Registered with `AddScheme`, the scheme is enforced on every route that names it, after group middleware and before binding. A plain error from `Verify` is a generic 401 with `Challenge` as `WWW-Authenticate`; a `*server.ErrorModel` (for example `server.Error403`) is sent as is.
+- Alternatives are OR-ed (`[]map[string][]string{{"bearer": nil}, {"key": nil}}`); schemes in one alternative are AND-ed.
+- Registered only with `BearerAuth`, a scheme is documentation and not enforced. An unregistered name panics at registration, so register schemes before the routes that use them.
+- Secured routes document a 401.
+
+## Security headers, idempotency, pagination, readiness, tracing
+
+- `api.Use(middleware.SecureHeaders(middleware.SecureHeadersConfig{}))`: nosniff, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. `ContentSecurityPolicy` and `HSTSMaxAge` are opt-in (a CSP like `default-src 'none'` breaks pages that load scripts, such as `/docs` or a SPA).
+- `api.Use(middleware.Idempotency(middleware.IdempotencyConfig{}))`: POST/PATCH with `Idempotency-Key` replay the first final response (marked `Idempotent-Replayed: true`); same key with a different method, path, body or `Authorization` is 422; a duplicate while the first runs is 409. 5xx and 401/403/408/425/429 are not stored so they can be retried. `TTL` (24 h) is how long a response is kept, `LockTTL` (5 min) how long an unfinished request holds its key. The default store is in-memory; for several instances implement `middleware.IdempotencyStore`:
+  - `Begin(ctx, key, fingerprint, ttl) (existing *IdempotencyEntry, claimed bool, err error)` is one atomic step (Redis `SET NX PX`, unique insert): a free key stores a pending entry for `ttl` and returns `nil, true, nil`; a taken key returns a copy and `false`. Exactly one of N concurrent callers may claim. An error here makes the middleware answer 503 without running the handler.
+  - `Finish(ctx, key, entry, ttl)` replaces the pending entry with the final one for `ttl` (the response TTL). `Release(ctx, key)` deletes it and is not an error for an unknown key. Their errors are only logged, and their context is not cancelled when the client hangs up.
+  - Return copies, never "key exists" as an error, and let pending entries expire by themselves. Test with `idempotencytest.Run(t, func(t *testing.T) middleware.IdempotencyStore { return newStore(t) })`, each call returning an empty store.
+- Pagination: embed `server.Page` in the input (`limit`, default 20, max 100; `cursor`), return `server.PageBody[T]`, and build it with `server.Paginate(rows, in.Limit, func(x T) any { return x.ID })` after fetching `in.Limit+1` rows. Decode incoming cursors with `server.DecodeCursor`, and on failure return `server.InvalidCursor(err)` (a 422 on `query.cursor`). Cursors are opaque; the next cursor is absent on the last page.
+- `api.ShutdownDelay = 5 * time.Second` keeps serving after shutdown starts so a load balancer can drain. `server.Handle(api, "GET /readyz", web.ReadyFor(api, timeout, checks))` answers 503 `draining` from the moment shutdown starts. HTTP timeouts default to header 10 s, read 1 min, idle 2 min, write none (streams); raise `ReadTimeout` for big uploads.
+- `api.Use(middleware.Trace(tracer))`, where `Tracer` is `Start(r *http.Request) (context.Context, middleware.Span)` and `Span` is `End(middleware.SpanResult)`. The returned context reaches the handler; `End` runs once with `Route` (the matched pattern such as `GET /users/{id}`, or `unrouted`) and `Status` (500 after a panic). Name the span in `End`, since the route is unknown in `Start`. A nil span skips the request, a nil context keeps the request's own, `Trace(nil)` panics. `middleware.TracerFunc` adapts a function. Wrap OpenTelemetry or anything else in the app; the framework has no dependency.
 
 ## OpenAPI
 
@@ -221,7 +244,7 @@ Without starting a server: `api.WriteSpec("openapi.yaml")` (`.yaml`/`.yml` give 
 
 ## Not supported (don't invent it)
 
-Enforcement of `Security` (it is documentation), request bodies that can't decode to a generic value (XML) besides JSON, forms and `Decoders`, validation hooks on types nested below `Body`, a hard request timeout (`Timeout` is cooperative), transports other than HTTP.
+Security schemes beyond a `Verify` hook (OAuth flows, scope checks beyond what `Verify` does, token issuance), request bodies that can't decode to a generic value (XML) besides JSON, forms and `Decoders`, validation hooks on types nested below `Body`, a hard request timeout (`Timeout` is cooperative), transports other than HTTP.
 
 ## Testing
 

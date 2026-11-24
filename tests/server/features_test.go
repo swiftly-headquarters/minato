@@ -188,6 +188,7 @@ func TestGroupsAndMiddleware(t *testing.T) {
 func TestSecurityAndErrorDocs(t *testing.T) {
 	api := server.New("t", "1")
 	api.BearerAuth("bearer")
+	api.BearerAuth("other")
 	g := api.Group("/secure")
 	g.Security = server.Secured("bearer", "read")
 	server.Get(g, "/a", noop, func(o *server.Operation) { o.Errors = []int{404, 409} })

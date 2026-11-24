@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,13 +46,18 @@ type Response struct {
 type Middleware func(http.Handler) http.Handler
 
 type API struct {
-	Spec            *OpenAPI
-	MaxBodyBytes    int64
-	ShutdownTimeout time.Duration
-	ETag            bool
-	TLS             *tls.Config
-	OnStart         func(net.Addr)
-	OnStop          func(context.Context)
+	Spec              *OpenAPI
+	MaxBodyBytes      int64
+	ShutdownTimeout   time.Duration
+	ShutdownDelay     time.Duration
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ETag              bool
+	TLS               *tls.Config
+	OnStart           func(net.Addr)
+	OnStop            func(context.Context)
 
 	Formats  map[string]Encoder
 	Decoders map[string]Decoder
@@ -61,7 +67,11 @@ type API struct {
 	root     *Group
 	mws      []Middleware
 	handler  http.Handler
+	draining atomic.Bool
+	schemes  map[string]Scheme
 }
+
+func (a *API) Draining() bool { return a.draining.Load() }
 
 func New(title, version string) *API {
 	reg := &registry{schemas: map[string]*Schema{}, names: map[reflect.Type]string{}}
@@ -72,10 +82,14 @@ func New(title, version string) *API {
 			Paths:      map[string]map[string]*OperationDoc{},
 			Components: Components{Schemas: reg.schemas},
 		},
-		MaxBodyBytes:    1 << 20,
-		ShutdownTimeout: 10 * time.Second,
-		Formats:         map[string]Encoder{jsonMIME: json.Marshal},
-		Decoders:        map[string]Decoder{jsonMIME: decodeJSON},
+		MaxBodyBytes:      1 << 20,
+		ShutdownTimeout:   10 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		Formats:           map[string]Encoder{jsonMIME: json.Marshal},
+		Decoders:          map[string]Decoder{jsonMIME: decodeJSON},
+		schemes:           map[string]Scheme{},
 		Docs: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			io.WriteString(w, docsHTML)
@@ -181,6 +195,13 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 			panic(fmt.Sprintf("minato: %s %s: response status %d is not a valid HTTP status", op.Method, op.Path, rs.Status))
 		}
 	}
+	for _, req := range op.Security {
+		for name := range req {
+			if !api.knownScheme(name) {
+				panic(fmt.Sprintf("minato: %s %s: security scheme %q is not registered (call AddScheme or BearerAuth first)", op.Method, op.Path, name))
+			}
+		}
+	}
 	in := api.reg.input(reflect.TypeFor[I](), op.Path)
 	out := api.reg.output(reflect.TypeFor[O]())
 	if op.OperationID == "" {
@@ -191,7 +212,7 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 	if route == "/" {
 		pattern += "{$}"
 	}
-	api.mux.Handle(pattern, routed(op.Method+" "+op.Path, chain(g.mws, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api.mux.Handle(pattern, routed(op.Method+" "+op.Path, chain(g.mws, api.enforce(op.Security, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var mime string
 		var enc Encoder
 		if out.negotiated() {
@@ -220,7 +241,7 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 			return
 		}
 		out.write(w, r, reflect.ValueOf(o), op.DefaultStatus, mime, enc, len(api.Formats) > 1, api.ETag)
-	}))))
+	})))))
 }
 
 func defaultOperationID(method, path string) string {

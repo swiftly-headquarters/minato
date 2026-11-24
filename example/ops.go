@@ -12,7 +12,7 @@ import (
 
 func registerOps(api *server.API, metrics *middleware.Metrics) {
 	server.Handle(api, "GET /healthz", web.Live())
-	server.Handle(api, "GET /readyz", web.Ready(2*time.Second, map[string]web.Check{
+	server.Handle(api, "GET /readyz", web.ReadyFor(api, 2*time.Second, map[string]web.Check{
 		"store": func(context.Context) error { store.Count(); return nil },
 	}))
 	server.Handle(api, "GET /metrics", metrics)

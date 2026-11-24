@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/swiftly-headquarters/minato/middleware"
 	"github.com/swiftly-headquarters/minato/server"
@@ -18,7 +19,6 @@ import (
 func main() {
 	api := server.New("Minato Example", "1.0.0")
 	api.Spec.Servers = []server.Server{{URL: "http://localhost:8080"}}
-	api.BearerAuth("bearer")
 	slog.SetDefault(slog.New(middleware.SlogContext(slog.NewTextHandler(os.Stderr, nil))))
 	ids := middleware.RequestIDConfig{}
 	if prefix := os.Getenv("REQUEST_ID_PREFIX"); prefix != "" {
@@ -32,6 +32,8 @@ func main() {
 		metrics.Middleware(),
 		middleware.CORS(middleware.CORSConfig{}),
 		middleware.RateLimit(middleware.RateLimitConfig{Rate: 50, Burst: 100}),
+		middleware.SecureHeaders(middleware.SecureHeadersConfig{}),
+		middleware.Idempotency(middleware.IdempotencyConfig{}),
 		middleware.Gzip(),
 	)
 	if os.Getenv("OFFLINE_DOCS") != "" {
@@ -72,6 +74,13 @@ func main() {
 	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = ":8080"
+	}
+	if v := os.Getenv("SHUTDOWN_DELAY"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatalf("SHUTDOWN_DELAY: %v", err)
+		}
+		api.ShutdownDelay = d
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

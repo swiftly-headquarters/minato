@@ -21,7 +21,7 @@ const patched = await api.users.update({ path: { id: user.id }, body: { role: "a
 check("patch user", patched.role === "admin" && patched.name === "Ada", JSON.stringify(patched));
 
 const list = await api.users.list({ query: { limit: 5 } });
-check("list users (query param)", Array.isArray(list) && list.length >= 1);
+check("list users (query param, paginated)", Array.isArray(list.items) && list.items.length >= 1, JSON.stringify(list));
 
 try {
   await api.users.create({ body: { name: "", email: "nope" } });

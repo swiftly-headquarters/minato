@@ -28,7 +28,14 @@ func (a *API) Serve(ctx context.Context, ln net.Listener) error {
 			a.OnStop(sctx)
 		}()
 	}
-	srv := &http.Server{Handler: a, TLSConfig: a.TLS, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Handler:           a,
+		TLSConfig:         a.TLS,
+		ReadHeaderTimeout: a.ReadHeaderTimeout,
+		ReadTimeout:       a.ReadTimeout,
+		WriteTimeout:      a.WriteTimeout,
+		IdleTimeout:       a.IdleTimeout,
+	}
 	errc := make(chan error, 1)
 	go func() {
 		if a.TLS != nil {
@@ -41,6 +48,10 @@ func (a *API) Serve(ctx context.Context, ln net.Listener) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
+	}
+	a.draining.Store(true)
+	if a.ShutdownDelay > 0 {
+		time.Sleep(a.ShutdownDelay)
 	}
 	sctx, cancel := context.WithTimeout(context.Background(), a.ShutdownTimeout)
 	defer cancel()

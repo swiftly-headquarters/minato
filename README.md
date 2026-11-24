@@ -275,22 +275,151 @@ Every request gets an ID, sent back as `X-Request-ID`, stored in the context (`m
 - **Header name:** `Header: "X-Correlation-ID"`.
 - **Your own logs:** `slog.SetDefault(slog.New(middleware.SlogContext(handler)))` adds `request_id` to every record logged with a request context (`slog.InfoContext(ctx, ...)`). Wrap a real handler such as `slog.NewJSONHandler(os.Stdout, nil)`, not `slog.Default().Handler()`, which deadlocks.
 
-## Bearer auth
+## Auth schemes
 
-`Security` in the spec is documentation. `middleware.Bearer` is the enforcement:
+Register a scheme with `AddScheme` and the framework enforces it on every route that names it in `Secured`. `Verify` receives the request and the scopes of the operation, and returns a context for the handler or an error:
 
 ```go
-admin := api.Group("/admin", middleware.Bearer(func(ctx context.Context, token string) (context.Context, error) {
-	user, err := users.ByToken(ctx, token)
-	if err != nil {
-		return nil, err
-	}
-	return context.WithValue(ctx, userKey{}, user), nil
-}))
+api.AddScheme("bearer", server.Scheme{
+	Spec:      map[string]any{"type": "http", "scheme": "bearer"},
+	Challenge: "Bearer",
+	Verify: func(ctx context.Context, r *http.Request, scopes []string) (context.Context, error) {
+		token, ok := server.BearerToken(r)
+		if !ok {
+			return nil, errors.New("missing token")
+		}
+		user, err := users.ByToken(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		return context.WithValue(ctx, userKey{}, user), nil
+	},
+})
+
+admin := api.Group("/admin")
 admin.Security = server.Secured("bearer")
+server.Get(admin, "/stats", stats, func(o *server.Operation) {
+	o.Security = server.Secured("bearer", "admin") // scopes are passed to Verify
+})
 ```
 
-A missing, empty or non-Bearer `Authorization` header is a 401 with `WWW-Authenticate: Bearer`. If `verify` returns an ordinary error, the client gets a 401 with `error="invalid_token"` and no details. To pick another response, return a `*server.ErrorModel`: `server.Error403(...)`, or `server.NewError(503, ...)` when the auth backend is down. Compare secrets in constant time (`crypto/subtle`) inside `verify`.
+- Enforcement runs after the group's middleware and before the body is bound, so rejected requests never reach validation or the handler.
+- A plain error from `Verify` becomes a generic 401 with the scheme's `Challenge` as `WWW-Authenticate`. Return a `*server.ErrorModel`, such as `server.Error403(...)` for a missing scope, and it is sent as is.
+- Alternatives are OR-ed: `[]map[string][]string{{"bearer": nil}, {"key": nil}}` passes when either scheme does. Schemes inside one alternative are AND-ed.
+- Schemes registered only with `BearerAuth` are documentation and are not enforced. A name that was never registered panics at registration, so typos fail at startup. Register schemes before the routes that use them.
+- `middleware.Bearer` still works for a single group if you prefer a middleware.
+
+Routes that use a scheme document a 401 in the spec. Compare secrets in constant time (`crypto/subtle`).
+
+## Security headers
+
+```go
+api.Use(middleware.SecureHeaders(middleware.SecureHeadersConfig{}))
+```
+
+Sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer` by default. `ContentSecurityPolicy` and `HSTSMaxAge` are opt-in: a CSP such as `default-src 'none'` suits an API, but not a page that loads scripts, like `/docs` or a SPA. Handlers can override any header.
+
+## Idempotency keys
+
+```go
+api.Use(middleware.Idempotency(middleware.IdempotencyConfig{}))
+```
+
+- For POST and PATCH requests that send `Idempotency-Key`, a repeat with the same key, method, path, body and `Authorization` header replays the first response, marked `Idempotent-Replayed: true`. The same key with anything else is a 422, and a duplicate that arrives while the first is still running is a 409.
+- Only final answers are stored. 5xx responses and 401, 403, 408, 425 and 429 are not, so a failed attempt can be retried. Bodies up to 1 MiB are stored.
+- The default store is in memory for one process. With several instances, or to survive restarts, implement `IdempotencyStore` (below). `TTL` (default 24 h) is how long a stored response lives and `LockTTL` (default 5 min) how long an unfinished request holds its key.
+- If the store fails on `Begin`, the request gets a 503 and the handler does not run, because running it could repeat the work. Errors from `Finish` and `Release` are logged and the client still gets the real response.
+
+### Writing a store
+
+```go
+type IdempotencyStore interface {
+	Begin(ctx context.Context, key, fingerprint string, ttl time.Duration) (existing *IdempotencyEntry, claimed bool, err error)
+	Finish(ctx context.Context, key string, e IdempotencyEntry, ttl time.Duration) error
+	Release(ctx context.Context, key string) error
+}
+```
+
+- `Begin` must be one atomic step (Redis `SET key value NX PX ttl`, a unique-key insert in SQL). If the key is free, store a pending entry with the fingerprint that lives for `ttl` (the `LockTTL`) and return `nil, true, nil`. If it exists, return a copy of it and `false`. Two concurrent callers must never both get `true`.
+- `Finish` replaces the pending entry with the final one (`Done` is set by the store) and gives it a new lifetime of `ttl` (the response `TTL`). `Release` deletes the key and must not fail for a key that doesn't exist.
+- The pending entry must expire by itself, so a process that crashes mid-request doesn't block the key for a day.
+- Return an error only for store failures, never for "key exists". `Finish` and `Release` get a context that is not cancelled when the client disconnects.
+- An entry holds the fingerprint, status, headers and body. Encode them however you like (JSON works, `Body` is base64 in it), and return copies so callers can't alter stored data.
+
+`idempotencytest.Run` checks all of this against your implementation, including 64 concurrent `Begin` calls and both expiry rules:
+
+```go
+func TestMyStore(t *testing.T) {
+	idempotencytest.Run(t, func(t *testing.T) middleware.IdempotencyStore { return newRedisStore(t) })
+}
+```
+
+Each call of the factory must return a store with no keys in it. The suite sleeps up to a few hundred milliseconds for the expiry cases.
+
+## Pagination
+
+```go
+type ListInput struct {
+	server.Page // limit (default 20, max 100) and cursor
+}
+type ListOutput struct {
+	Body server.PageBody[User]
+}
+
+func listUsers(ctx context.Context, in *ListInput) (*ListOutput, error) {
+	after := 0
+	if in.Cursor != "" {
+		if err := server.DecodeCursor(in.Cursor, &after); err != nil {
+			return nil, server.InvalidCursor(err)
+		}
+	}
+	rows := store.List(after, in.Limit+1) // one extra row tells us whether there is a next page
+	return &ListOutput{Body: server.Paginate(rows, in.Limit, func(u User) any { return u.ID })}, nil
+}
+```
+
+The response is `{"items": [...], "next_cursor": "..."}`, and `next_cursor` is absent on the last page. Cursors are opaque: clients must send them back unchanged. Generic bodies get a readable name in the spec, here `PageBodyUser`.
+
+## Shutdown and readiness
+
+```go
+api.ShutdownDelay = 5 * time.Second // keep serving while the load balancer notices
+server.Handle(api, "GET /readyz", web.ReadyFor(api, 2*time.Second, checks))
+```
+
+- When the context is done, `/readyz` answers 503 with `"status":"draining"` straight away. The server keeps serving for `ShutdownDelay`, then drains in-flight requests for `ShutdownTimeout`.
+- HTTP timeouts: `ReadHeaderTimeout` 10 s, `ReadTimeout` 1 min (it covers the whole body, so raise it for large uploads), `IdleTimeout` 2 min, and `WriteTimeout` none, because streams and SSE can be long.
+
+## Tracing
+
+```go
+type Tracer interface {
+	Start(r *http.Request) (context.Context, Span)
+}
+type Span interface {
+	End(SpanResult) // Route is the matched pattern such as "GET /users/{id}", or "unrouted"; Status is the final status
+}
+```
+
+`api.Use(middleware.Trace(myTracer))` calls `Start` for every request, passes the returned context to the handler and the rest of the middleware, and calls `End` once when the request is over. Implement the two interfaces on top of whatever you use (OpenTelemetry, Datadog, your own logger), so the framework has no dependency:
+
+```go
+func (t otelTracer) Start(r *http.Request) (context.Context, middleware.Span) {
+	ctx, span := t.tracer.Start(r.Context(), r.Method+" "+r.URL.Path)
+	return ctx, otelSpan{span}
+}
+
+func (s otelSpan) End(res middleware.SpanResult) {
+	s.span.SetName(res.Route)
+	s.span.SetAttributes(attribute.Int("http.status_code", res.Status))
+	s.span.End()
+}
+```
+
+- The route is only known when the request ends, so name the span in `End`, not in `Start`.
+- Return a nil span if you decide not to trace a request, and a nil context to keep the request's own. `Trace(nil)` panics at setup.
+- A panic in a handler ends the span with status 500. `middleware.TracerFunc` turns a plain function into a `Tracer`.
+- Put `Trace` first (after `RequestID`) so the span covers the other middleware. `Start` runs before routing, so it can read headers (for example `traceparent`) but not path parameters.
 
 ## Rate limiting
 
@@ -410,6 +539,7 @@ A body that is a struct, map or slice is sent as JSON. A `string`, `[]byte` or `
 go run ./example           # http://localhost:8080/docs
 go run ./example openapi   # print the spec (add a file name to write it, .yaml for YAML)
 OFFLINE_DOCS=1 go run ./example   # /docs rendered by the server, no CDN
+SHUTDOWN_DELAY=5s go run ./example # on SIGTERM, /readyz answers 503 "draining" for 5s before the server stops accepting
 WEB_PROXY=http://localhost:5173 go run ./example   # proxy "/" to a dev server instead of the embedded build
 REQUEST_ID_PREFIX=ex go run ./example              # custom request id generator: ex-<random>
 TLS_CERT=cert.pem TLS_KEY=key.pem go run ./example # serve HTTPS

@@ -176,7 +176,7 @@ func (r *registry) uniqueName(t reflect.Type) string {
 			return c
 		}
 		return -1
-	}, t.Name())
+	}, schemaName(t))
 	name := base
 	for i := 2; slices.Contains(slices.Collect(maps.Values(r.names)), name); i++ {
 		name = base + strconv.Itoa(i)

@@ -323,12 +323,23 @@
           {
             "name": "limit",
             "in": "query",
+            "description": "Maximum number of items to return",
             "schema": {
               "type": "integer",
               "format": "int64",
+              "description": "Maximum number of items to return",
               "default": 20,
               "minimum": 1,
               "maximum": 100
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's next_cursor; omit for the first page",
+            "schema": {
+              "type": "string",
+              "description": "Opaque cursor from the previous page's next_cursor; omit for the first page"
             }
           }
         ],
@@ -338,10 +349,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/User"
-                  }
+                  "$ref": "#/components/schemas/PageBodyUser"
                 }
               }
             }
@@ -660,6 +668,24 @@
             "description": "URI identifying the problem type"
           }
         }
+      },
+      "PageBodyUser": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/User"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Pass as cursor to get the next page; absent on the last page"
+          }
+        },
+        "required": [
+          "items"
+        ]
       },
       "PatchBody": {
         "type": "object",

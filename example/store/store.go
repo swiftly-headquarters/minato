@@ -56,11 +56,14 @@ func Update(id int, apply func(*User)) (User, bool) {
 	return u, ok
 }
 
-func List(limit int) []User {
+func List(after, limit int) []User {
 	mu.Lock()
 	defer mu.Unlock()
 	out := []User{}
 	for _, id := range slices.Sorted(maps.Keys(users)) {
+		if id <= after {
+			continue
+		}
 		if len(out) == limit {
 			break
 		}
