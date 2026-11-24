@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"maps"
 	"net/http"
 	"reflect"
@@ -91,7 +92,7 @@ func (a *API) document(op Operation, in *input, out *output) {
 		}
 	}
 	if in.body != nil {
-		d.RequestBody = &RequestBodyDoc{Required: in.body.required, Content: content(in.body, []string{jsonMIME})}
+		d.RequestBody = &RequestBodyDoc{Required: in.body.required, Content: content(in.body, slices.Sorted(maps.Keys(a.Decoders)))}
 	}
 	if in.form {
 		form := &MediaType{Schema: in.formDoc}
@@ -114,8 +115,24 @@ func (a *API) document(op Operation, in *input, out *output) {
 	d.Responses[strconv.Itoa(status)] = resp
 	problem := map[string]*MediaType{"application/problem+json": {Schema: a.reg.schema(errorModelType)}}
 	d.Responses["default"] = &ResponseDoc{Description: "Error", Content: problem}
+	if len(in.params) > 0 || in.body != nil || in.hook || in.bodyHook {
+		if _, taken := d.Responses["422"]; !taken {
+			d.Responses["422"] = &ResponseDoc{Description: http.StatusText(http.StatusUnprocessableEntity), Content: problem}
+		}
+	}
 	for _, code := range op.Errors {
 		d.Responses[strconv.Itoa(code)] = &ResponseDoc{Description: http.StatusText(code), Content: problem}
+	}
+	for _, rs := range op.Responses {
+		key := strconv.Itoa(rs.Status)
+		doc := &ResponseDoc{Description: cmp.Or(rs.Description, http.StatusText(rs.Status))}
+		if old := d.Responses[key]; old != nil {
+			doc.Headers = old.Headers
+		}
+		if rs.Body != nil {
+			doc.Content = content(a.reg.typeField(reflect.TypeOf(rs.Body)), slices.Sorted(maps.Keys(a.Formats)))
+		}
+		d.Responses[key] = doc
 	}
 
 	path := strings.ReplaceAll(op.Path, "...}", "}")

@@ -56,7 +56,6 @@ body:
         - Struct tags / validation
         - OpenAPI output
         - Routing / registration
-        - New transport (e.g. raw TCP)
         - Not sure
     validations:
       required: true

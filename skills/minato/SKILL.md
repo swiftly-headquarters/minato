@@ -1,6 +1,6 @@
 ---
 name: minato
-description: Write and change HTTP endpoints with minato, a Go app server framework where each route is a typed function and its input and output structs define binding, validation and the OpenAPI 3.1 document. Covers path, query, header and cookie params, JSON bodies, form and file uploads, streaming and server-sent events, response formats, groups, middleware (logging, CORS, gzip, timeouts), security, and serving static files, a single-page app or a reverse proxy to a dev server. Use when a Go project imports github.com/swiftly-headquarters/minato/server, middleware or web, or when asked to add or edit an endpoint, request or response type, validation rule, upload, stream, error response or API spec in such a project.
+description: Write and change HTTP endpoints with minato, a Go app server framework where each route is a typed function and its input and output structs define binding, validation and the OpenAPI 3.1 document. Covers path, query, header and cookie params, JSON bodies, custom validation hooks, PATCH with optional and nullable fields, other request body formats, several response types per route, form and file uploads, streaming and server-sent events, response formats, groups, middleware (logging, CORS, gzip, timeouts), security, serving static files, a single-page app or a reverse proxy to a dev server, writing the OpenAPI spec to a file or checking it in CI, generating SDKs from it with takumi, running over TLS or a unix socket with start and stop hooks, in-process API tests, request IDs, bearer auth, rate limiting, health checks, Prometheus metrics, ETags. Use when a Go project imports github.com/swiftly-headquarters/minato/server, middleware, web or servertest, or when asked to add or edit an endpoint, request or response type, validation rule, upload, stream, error response or API spec in such a project.
 ---
 
 # minato
@@ -94,7 +94,13 @@ type UploadInput struct {
 
 ## Formats
 
-`api.Formats` maps lower-case media types to `func(any) ([]byte, error)`, JSON by default. Add to it before registering routes so the spec lists them: `api.Formats["application/xml"] = xml.Marshal` (use `xml:` tags on the body types). The `Accept` header picks the best match by q-value (JSON wins ties); no match returns 406 before the handler runs. Errors are always `application/problem+json`. Request bodies are JSON or forms only.
+`api.Formats` maps lower-case media types to `func(any) ([]byte, error)`, JSON by default. Add to it before registering routes so the spec lists them: `api.Formats["application/xml"] = xml.Marshal` (use `xml:` tags on the body types). The `Accept` header picks the best match by q-value (JSON wins ties); no match returns 406 before the handler runs. Errors are always `application/problem+json`.
+
+Request bodies: JSON is built in, and a missing or unknown `Content-Type` (including `application/merge-patch+json`) is treated as JSON. `api.Decoders["application/yaml"] = func(b []byte) (any, error)` adds a type, chosen by `Content-Type`; set it before registering routes so the spec lists it. The decoder must return a generic value (string-keyed maps, slices, strings, numbers, bools), because the result is validated and bound like JSON. Formats that can't (XML) belong in a handler with a `[]byte` body.
+
+## Several response types
+
+`o.Responses = []server.Response{{Status: 202, Description: "...", Body: Accepted{}}}` documents extra statuses and bodies in the spec (any status 100-599, else registration panics; a `Body` is a zero value of the type, nil for none). The output struct then returns whichever it wants: `Status int` plus `Body any`. Documentation only, the runtime doesn't check the body against the list. An entry for the default status replaces its description and body, and keeps the header fields.
 
 ## Custom schemas
 
@@ -102,7 +108,9 @@ A type whose JSON form differs from its Go shape implements `server.Schemer` (`S
 
 ## Validation tags
 
-`doc format enum default example minimum maximum minLength maxLength minItems maxItems pattern required`
+`doc format enum default example minimum maximum exclusiveMinimum exclusiveMaximum multipleOf minLength maxLength minItems maxItems uniqueItems pattern required`
+
+- `multipleOf` must be above 0 (else registration panics). `uniqueItems:"true"` compares numbers by value (`1` equals `1.0`) and reports the later duplicate's index.
 
 - `enum:"a,b"` is a comma list; on a slice it constrains the items.
 - Body object fields are required unless they are pointers, `omitempty`/`omitzero`, have a `default`, or set `required:"false"`. `required:"true"` forces it.
@@ -111,11 +119,30 @@ A type whose JSON form differs from its Go shape implements `server.Schemer` (`S
 - Invalid input returns 422 with every problem listed; bad JSON returns 400; oversized body returns 413 (`api.MaxBodyBytes`, default 1 MiB).
 - Statuses minato sends on its own: 406 (no registered format matches `Accept`, checked before the handler runs), 415 (form route, other content type), 503 (`middleware.Timeout` fired), 413, 422, 400.
 
+## Custom validation
+
+A cross-field check is a `Validate(ctx context.Context) []error` method on the input struct, or on the `Body` type (both run, input first). It runs only after binding and tag validation passed, so it sees defaults and parsed values, and its errors are added to the same 422. `server.FieldError("body.end", "must be after start")` sets the location; a plain `error` gets none and its text is sent to the client, so never return internal errors. Nested types deeper than `Body` are not checked.
+
+## PATCH: Optional and Nullable
+
+For partial updates use `server.Optional[T]` (omitted vs sent, including the zero value) and `server.Nullable[T]` (also an explicit `null`). Both have `Value T` and `Set bool`, `Nullable` also `Null bool`:
+
+```go
+type PatchBody struct {
+	Name server.Optional[string] `json:"name" minLength:"1"`
+	Nick server.Nullable[string] `json:"nick"`
+}
+if b.Name.Set { u.Name = b.Name.Value }
+if b.Nick.Set { if b.Nick.Null { u.Nick = "" } else { u.Nick = b.Nick.Value } }
+```
+
+They are never required, tags apply to `T`, and `null` for an `Optional` is a 422 ("omit the field, or use server.Nullable"). The spec shows `Nullable` as `type: ["string","null"]` (or `anyOf` with null for objects and refs). Use `omitzero` when marshalling them in outputs. `Optional` also works on query and header params. Don't use pointers for this: a `*T` can't tell omitted from null.
+
 ## Errors
 
 Return `server.Error400/401/403/404/409/422(detail)` or `server.NewError(status, detail, details...)`. They produce an RFC 9457 `application/problem+json` response. Any other error becomes an opaque 500 (logged via `slog`, message not sent to the client), so wrap expected failures in these helpers. A panic in a handler or middleware is recovered the same way (logged with a stack, 500 to the client).
 
-The spec documents a generic `default` error response. To list specific statuses per route, set `o.Errors = []int{404, 409}` (4xx/5xx only, otherwise registration panics). Validation 422s are not listed automatically. In middleware, reject with `server.WriteError(w, server.Error401("..."))` so the response matches the rest of the API.
+The spec documents a generic `default` error response. To list specific statuses per route, set `o.Errors = []int{404, 409}` (4xx/5xx only, otherwise registration panics). A 422 is added to the spec automatically for any route with params, a body or a `Validate` hook, so don't list 422 yourself. In middleware, reject with `server.WriteError(w, server.Error401("..."))` so the response matches the rest of the API.
 
 ## Groups and middleware
 
@@ -142,7 +169,17 @@ server.Get(admin, "/stats", stats)                // GET /v1/admin/stats
 - `Gzip()`: compresses everything for gzip clients (no size or type filter) and passes 204, HEAD and already-encoded responses through.
 - `Timeout(d)`: sets a context deadline only, so handlers must pass `ctx` to slow calls. A returned error wrapping `context.DeadlineExceeded` becomes a 503 problem. Keep it off SSE and long streams.
 
-Typical order: `api.Use(middleware.Logger(nil), middleware.CORS(cfg), middleware.Gzip())`.
+Typical order (first = outermost): `api.Use(middleware.RequestID(ids), middleware.Logger(nil), metrics.Middleware(), middleware.CORS(cfg), middleware.RateLimit(limits), middleware.Gzip())`.
+
+### Production middleware
+
+- **`RequestID(RequestIDConfig{Header, Generate, IgnoreIncoming})`**: every request gets an ID, set as `X-Request-ID` (or `Header`) on the response and on the request headers (so `web.Proxy` forwards it), and stored in the context: `middleware.RequestIDFromContext(ctx)`. Default is 32 random hex chars (`middleware.NewRequestID()`). A custom generator is `Generate: func(r *http.Request) string { return "api-" + middleware.NewRequestID() }`; an empty return falls back to the default. A valid incoming ID (1-128 printable ASCII, no spaces) is kept unless `IgnoreIncoming`; anything else is replaced. Put it first so `Logger` and everything after sees the ID. `Logger` adds `request_id` itself, and minato's unhandled-error and panic logs include it.
+- **`SlogContext(handler)`**: wraps a slog handler so records logged with a request context (`slog.InfoContext(ctx, ...)`) get `request_id`. `slog.SetDefault(slog.New(middleware.SlogContext(slog.NewJSONHandler(os.Stdout, nil))))`. Never wrap `slog.Default().Handler()` (deadlock).
+- **`Bearer(verify func(ctx, token) (context.Context, error))`**: enforces `Authorization: Bearer`. No or malformed header: 401 with `WWW-Authenticate: Bearer`. Ordinary error from `verify`: 401 `invalid_token` without details. Return a `*server.ErrorModel` (`server.Error403(...)`, `server.NewError(503, ...)`) to choose the response. Return a derived context to pass the user to handlers. Use on a group; pair it with `Security = server.Secured("bearer")` so the spec says the same. Compare secrets with `crypto/subtle`. `Bearer(nil)` panics.
+- **`RateLimit(RateLimitConfig{Rate, Burst, Key, MaxKeys, Now})`**: in-memory token bucket per client, 429 problem with `Retry-After`. `Rate` (per second, above 0, else panic) and `Burst` (default `ceil(Rate)`). Default key is the connecting address with IPv6 grouped by /64; behind a proxy supply `Key` (the real client address), and return `""` to exempt a request. Per process, bounded by `MaxKeys` (10000). Place it after `CORS`.
+- **`NewMetrics()`**: `m.Middleware()` records, `server.Handle(api, "GET /metrics", m)` serves Prometheus text: `http_requests_total{method,route,status}`, `http_request_duration_seconds`, `http_requests_in_flight`. `route` is the registered pattern; requests that reached no route (404, 405, or rejected by middleware that runs earlier, like `RateLimit`) are `unrouted`; unusual methods are `OTHER`. Protect `/metrics` if the server is public.
+- **Health** (package `web`): `server.Handle(api, "GET /healthz", web.Live())` and `server.Handle(api, "GET /readyz", web.Ready(timeout, map[string]web.Check{"db": func(ctx) error {...}}))`. Checks run concurrently; 503 if any fails, panics or times out; the body only says `ok`/`failed`/`timeout` per check (errors are logged, not sent).
+- **ETag**: `api.ETag = true` gives negotiated 200 GET/HEAD responses a weak `ETag` and answers `If-None-Match` with an empty 304 (the handler still runs). A handler-provided `header:"ETag"` output field is used instead and honoured even when `api.ETag` is off. Streams, raw bodies, errors and other statuses are untouched.
 
 ## Static files, SPAs and proxies
 
@@ -170,21 +207,35 @@ api.BearerAuth("bearer")                       // declares the scheme in the spe
 admin.Security = server.Secured("bearer")      // or o.Security = server.Secured("oauth", "read") on one operation; an operation's own value replaces the group's
 ```
 
-This is documentation only. minato never checks credentials: enforce them in middleware (see above). An operation cannot opt out of `Spec.Security` set globally.
+This is documentation only. minato never checks credentials: enforce them with `middleware.Bearer` (see above) or your own middleware. An operation cannot opt out of `Spec.Security` set globally.
 
 ## OpenAPI
 
-Served at `/openapi.json`, docs UI at `/docs` (Stoplight Elements from a CDN, needs internet). Don't register your own routes on those two paths. `api.Spec` is a plain struct tree you can edit before serving: `Servers`, `Info`, `Security`, `Components.SecuritySchemes`. Print it without running a server by marshalling `api.Spec` to JSON.
+Served at `/openapi.json`, docs UI at `/docs` (Stoplight Elements from a CDN by default, so the browser needs internet). `api.Docs = api.OfflineDocs()` serves a plain server-rendered page with no external requests, and `api.Docs` takes any `http.Handler`. Also served as YAML at `/openapi.yaml`. Don't register your own routes on those paths. `api.Spec` is a plain struct tree you can edit before serving: `Servers`, `Info`, `Security`, `Components.SecuritySchemes`.
+
+Without starting a server: `api.WriteSpec("openapi.yaml")` (`.yaml`/`.yml` give YAML, anything else JSON), or `api.SpecJSON()` / `api.SpecYAML()` for bytes. Typical use is a small `openapi` subcommand in the app's `main` that builds the API and calls `WriteSpec`, with the file committed and CI failing when regenerating it changes anything (`git status --porcelain -- openapi.json` non-empty). Spec files can be fed to `takumi` (`takumi -input openapi.json -output ./sdk -lang go|typescript`) to generate a typed client; in CI, pin its version.
+
+## Running
+
+`api.Run(ctx, addr)` serves until `ctx` is done. `addr` is `":8080"`, or `"unix:/run/app.sock"` for a unix socket (a stale socket file from a crash is replaced; a live socket or a regular file at that path is an error). `api.Serve(ctx, ln)` takes your own listener (port 0 in tests, systemd sockets). Set `api.TLS = &tls.Config{Certificates: ...}` (or `GetCertificate`) before running to serve HTTPS with HTTP/2; a config with no certificate makes it return an error. `api.OnStart = func(net.Addr)` runs after the listener is bound and before requests are served; `api.OnStop = func(context.Context)` runs after in-flight requests finished or `ShutdownTimeout` passed (the context has its own `ShutdownTimeout` deadline), and also if the server fails after starting, but not if binding failed. Use `OnStop` to close databases.
 
 ## Not supported (don't invent it)
 
-Enforcement of `Security` (it is documentation), an automatic 422 entry in the spec, request bodies other than JSON and forms, a hard request timeout (`Timeout` is cooperative), non-HTTP transports.
+Enforcement of `Security` (it is documentation), request bodies that can't decode to a generic value (XML) besides JSON, forms and `Decoders`, validation hooks on types nested below `Body`, a hard request timeout (`Timeout` is cooperative), transports other than HTTP.
 
 ## Testing
 
+Use `github.com/swiftly-headquarters/minato/servertest`, which calls the API in process (no ports):
+
 ```go
-rec := httptest.NewRecorder()
-api.ServeHTTP(rec, httptest.NewRequest("GET", "/users/1", nil))
+c := servertest.New(t, api)                        // build api in a helper so tests exercise real registration and catch startup panics
+c.Header.Set("Authorization", "Bearer dev-token")  // default headers for every request
+u := servertest.Decode[User](c.Post("/users", map[string]string{"name": "Ada"}).Status(201))
+c.Get("/users/99").Status(404)
+c.Get("/whoami", "X-Token", "override")            // per-call headers are key, value pairs and win over c.Header
 ```
 
-Build the API in a helper so tests exercise real registration and catch startup panics.
+- Helpers: `Get`, `Delete` (path, headers...), `Post`, `Put`, `Patch` (path, body, headers...), and `Do(method, path, body, headers...)` for the rest.
+- A struct, map or slice body is sent as JSON with `Content-Type: application/json`. A `string`, `[]byte` or `io.Reader` is sent as is: add `"Content-Type", "application/x-www-form-urlencoded"` for forms.
+- `Status(code)` and `Decode[T]` call `t.Fatalf` with the status and body on failure. `*Response` embeds `*httptest.ResponseRecorder` (`Code`, `Header()`, `Body`). `Decode` handles JSON only.
+- It tests the handler chain, not a network listener: for TLS, sockets or shutdown use `api.Serve` on a `net.Listen("tcp", "127.0.0.1:0")` listener.

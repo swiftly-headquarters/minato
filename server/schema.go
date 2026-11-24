@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -42,8 +44,36 @@ type Schema struct {
 	MinItems             *int               `json:"minItems,omitempty"`
 	MaxItems             *int               `json:"maxItems,omitempty"`
 	Pattern              string             `json:"pattern,omitempty"`
+	ExclusiveMinimum     *float64           `json:"exclusiveMinimum,omitempty"`
+	ExclusiveMaximum     *float64           `json:"exclusiveMaximum,omitempty"`
+	MultipleOf           *float64           `json:"multipleOf,omitempty"`
+	UniqueItems          bool               `json:"uniqueItems,omitempty"`
 
-	re *regexp.Regexp
+	re       *regexp.Regexp
+	nullable bool
+	notNull  bool
+}
+
+func (s Schema) MarshalJSON() ([]byte, error) {
+	type plain Schema
+	b, err := json.Marshal(plain(s))
+	if err != nil || !s.nullable {
+		return b, err
+	}
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	if len(s.Enum) > 0 {
+		m["enum"] = append(slices.Clone(s.Enum), nil)
+	}
+	if s.Type == "" {
+		return json.Marshal(map[string]any{"anyOf": []any{m, map[string]string{"type": "null"}}})
+	}
+	m["type"] = []string{s.Type, "null"}
+	return json.Marshal(m)
 }
 
 type registry struct {
@@ -81,6 +111,11 @@ func custom(t reflect.Type) *Schema {
 func (r *registry) schema(t reflect.Type) *Schema {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	if et, nullable, ok := unwrap(t); ok {
+		s := r.schema(et)
+		s.nullable, s.notNull = nullable, !nullable
+		return s
 	}
 	switch t {
 	case timeType:
@@ -172,7 +207,8 @@ func (r *registry) object(t reflect.Type) *Schema {
 		}
 		s.Properties[name] = r.fieldSchema(f)
 		_, hasDefault := f.Tag.Lookup("default")
-		optional := f.Type.Kind() == reflect.Pointer || hasDefault ||
+		_, _, wrapped := unwrap(ft)
+		optional := f.Type.Kind() == reflect.Pointer || hasDefault || wrapped ||
 			strings.Contains(opts, "omitempty") || strings.Contains(opts, "omitzero")
 		if req := f.Tag.Get("required"); req != "" {
 			optional = req != "true"
@@ -199,6 +235,12 @@ func applyTags(s *Schema, f reflect.StructField) {
 	t := f.Type
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	if et, _, ok := unwrap(t); ok {
+		t = et
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
 	}
 	tag := f.Tag
 	if v := tag.Get("doc"); v != "" {
@@ -234,12 +276,24 @@ func applyTags(s *Schema, f reflect.StructField) {
 			target.Enum = append(target.Enum, x)
 		}
 	}
-	for name, dst := range map[string]**float64{"minimum": &s.Minimum, "maximum": &s.Maximum} {
+	for name, dst := range map[string]**float64{
+		"minimum": &s.Minimum, "maximum": &s.Maximum,
+		"exclusiveMinimum": &s.ExclusiveMinimum, "exclusiveMaximum": &s.ExclusiveMaximum,
+		"multipleOf": &s.MultipleOf,
+	} {
 		if v := tag.Get(name); v != "" {
 			x, err := strconv.ParseFloat(v, 64)
 			must(err)
+			if name == "multipleOf" && x <= 0 {
+				must(errors.New("multipleOf must be greater than 0"))
+			}
 			*dst = &x
 		}
+	}
+	if v := tag.Get("uniqueItems"); v != "" {
+		b, err := strconv.ParseBool(v)
+		must(err)
+		s.UniqueItems = b
 	}
 	for name, dst := range map[string]**int{"minLength": &s.MinLength, "maxLength": &s.MaxLength, "minItems": &s.MinItems, "maxItems": &s.MaxItems} {
 		if v := tag.Get(name); v != "" {
@@ -295,6 +349,40 @@ var formats = map[string]func(string) bool{
 	"byte":      func(s string) bool { _, err := base64.StdEncoding.DecodeString(s); return err == nil },
 }
 
+func jsonValue(v any) any {
+	switch x := v.(type) {
+	case int64:
+		return json.Number(strconv.FormatInt(x, 10))
+	case uint64:
+		return json.Number(strconv.FormatUint(x, 10))
+	case float64:
+		return json.Number(strconv.FormatFloat(x, 'g', -1, 64))
+	case []any:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = jsonValue(x[i])
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = jsonValue(e)
+		}
+		return out
+	}
+	return v
+}
+
+func canonical(v any) string {
+	if n, ok := v.(json.Number); ok {
+		if f, err := n.Float64(); err == nil {
+			return strconv.FormatFloat(f, 'g', -1, 64)
+		}
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) []*ErrorDetail {
 	if s.Ref != "" {
 		s = r.schemas[strings.TrimPrefix(s.Ref, refPrefix)]
@@ -311,11 +399,12 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 		}
 		for name, ps := range s.Properties {
 			if _, ok := m[name]; !ok && ps.Default != nil {
-				m[name] = ps.Default
+				m[name] = jsonValue(ps.Default)
 			}
 		}
 		for _, name := range s.Required {
-			if m[name] == nil {
+			ps := s.Properties[name]
+			if x, ok := m[name]; !ok || (x == nil && (ps == nil || !ps.nullable)) {
 				errs = append(errs, &ErrorDetail{Location: loc + "." + name, Message: "required"})
 			}
 		}
@@ -324,7 +413,13 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 			if ps == nil {
 				ps = s.AdditionalProperties
 			}
-			if ps != nil && m[k] != nil {
+			switch {
+			case ps == nil:
+			case m[k] == nil:
+				if ps.notNull {
+					errs = append(errs, &ErrorDetail{Location: loc + "." + k, Message: "null is not allowed: omit the field, or use server.Nullable"})
+				}
+			default:
 				errs = r.validate(ps, m[k], loc+"."+k, errs)
 			}
 		}
@@ -343,6 +438,16 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 		for i, x := range a {
 			if x != nil {
 				errs = r.validate(s.Items, x, fmt.Sprintf("%s[%d]", loc, i), errs)
+			}
+		}
+		if s.UniqueItems {
+			seen := map[string]bool{}
+			for i, x := range a {
+				k := canonical(x)
+				if seen[k] {
+					errs = append(errs, &ErrorDetail{Location: fmt.Sprintf("%s[%d]", loc, i), Message: "duplicate item", Value: x})
+				}
+				seen[k] = true
 			}
 		}
 	case "string":
@@ -379,6 +484,17 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 		}
 		if s.Maximum != nil && f > *s.Maximum {
 			add("expected number <= %v", *s.Maximum)
+		}
+		if s.ExclusiveMinimum != nil && f <= *s.ExclusiveMinimum {
+			add("expected number > %v", *s.ExclusiveMinimum)
+		}
+		if s.ExclusiveMaximum != nil && f >= *s.ExclusiveMaximum {
+			add("expected number < %v", *s.ExclusiveMaximum)
+		}
+		if m := s.MultipleOf; m != nil {
+			if q := f / *m; math.Abs(q-math.Round(q)) > 1e-9*math.Max(1, math.Abs(q)) {
+				add("expected a multiple of %v", *m)
+			}
 		}
 	case "boolean":
 		if _, ok := v.(bool); !ok {

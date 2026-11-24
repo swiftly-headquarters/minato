@@ -44,7 +44,7 @@ func Handle(r Router, pattern string, h http.Handler) {
 	if method != "" {
 		p = method + " " + p
 	}
-	g.api.mux.Handle(p, chain(g.mws, h))
+	g.api.mux.Handle(p, routed(p, chain(g.mws, h)))
 }
 
 func register[I, O any](r Router, method, path string, h func(context.Context, *I) (*O, error), opts []func(*Operation)) {

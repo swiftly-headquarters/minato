@@ -17,8 +17,6 @@ func registerExtras(api *server.API) {
 		o.MaxBodyBytes = 10 << 20
 		o.Errors = []int{413, 415}
 	})
-
-	server.Head(api, "/healthz", func(ctx context.Context, _ *struct{}) (*struct{}, error) { return nil, nil }, summary("Check the server is up"))
 }
 
 type ClockOutput struct {

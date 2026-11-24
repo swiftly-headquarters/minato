@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"log"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,25 +19,63 @@ func main() {
 	api := server.New("Minato Example", "1.0.0")
 	api.Spec.Servers = []server.Server{{URL: "http://localhost:8080"}}
 	api.BearerAuth("bearer")
-	api.Use(middleware.Logger(nil), middleware.CORS(middleware.CORSConfig{}), middleware.Gzip())
+	slog.SetDefault(slog.New(middleware.SlogContext(slog.NewTextHandler(os.Stderr, nil))))
+	ids := middleware.RequestIDConfig{}
+	if prefix := os.Getenv("REQUEST_ID_PREFIX"); prefix != "" {
+		ids.Generate = func(*http.Request) string { return prefix + "-" + middleware.NewRequestID() }
+	}
+	metrics := middleware.NewMetrics()
+	api.ETag = true
+	api.Use(
+		middleware.RequestID(ids),
+		middleware.Logger(nil),
+		metrics.Middleware(),
+		middleware.CORS(middleware.CORSConfig{}),
+		middleware.RateLimit(middleware.RateLimitConfig{Rate: 50, Burst: 100}),
+		middleware.Gzip(),
+	)
+	if os.Getenv("OFFLINE_DOCS") != "" {
+		api.Docs = api.OfflineDocs()
+	}
 
 	server.Get(api, "/hello", hello, summary("Greet the caller"))
 	server.Get(api, "/files/{path...}", getFile, summary("Echo the requested path (catch-all demo)"))
 	registerUsers(api)
 	registerAdmin(api)
 	registerExtras(api)
+	registerOps(api, metrics)
 	registerWeb(api)
 
 	if len(os.Args) > 1 && os.Args[1] == "openapi" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		enc.Encode(api.Spec)
+		if len(os.Args) > 2 {
+			if err := api.WriteSpec(os.Args[2]); err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
+		b, err := api.SpecJSON()
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.Stdout.Write(b)
 		return
+	}
+	if cert, key := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"); cert != "" {
+		pair, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		api.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
+	}
+	api.OnStart = func(addr net.Addr) { log.Printf("listening on %s, docs at /docs", addr) }
+	api.OnStop = func(context.Context) { log.Println("stopped") }
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8080"
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Println("listening on :8080, docs at http://localhost:8080/docs")
-	if err := api.Run(ctx, ":8080"); err != nil {
+	if err := api.Run(ctx, addr); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -46,14 +46,18 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			if sw.status >= 500 {
 				level = slog.LevelError
 			}
-			log.LogAttrs(r.Context(), level, "request",
+			attrs := []slog.Attr{
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Int("status", sw.status),
 				slog.Int64("bytes", sw.bytes),
 				slog.Duration("duration", time.Since(start)),
 				slog.String("remote", r.RemoteAddr),
-			)
+			}
+			if id := RequestIDFromContext(r.Context()); id != "" {
+				attrs = append(attrs, slog.String("request_id", id))
+			}
+			log.LogAttrs(r.Context(), level, "request", attrs...)
 		})
 	}
 }

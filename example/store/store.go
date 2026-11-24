@@ -45,6 +45,17 @@ func Get(id int) (User, bool) {
 	return u, ok
 }
 
+func Update(id int, apply func(*User)) (User, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	u, ok := users[id]
+	if ok {
+		apply(&u)
+		users[id] = u
+	}
+	return u, ok
+}
+
 func List(limit int) []User {
 	mu.Lock()
 	defer mu.Unlock()

@@ -1,9 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"cmp"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"reflect"
 	"runtime/debug"
@@ -31,7 +32,14 @@ type Operation struct {
 	DefaultStatus int
 	MaxBodyBytes  int64
 	Errors        []int
+	Responses     []Response
 	Security      []map[string][]string
+}
+
+type Response struct {
+	Status      int
+	Description string
+	Body        any
 }
 
 type Middleware func(http.Handler) http.Handler
@@ -40,13 +48,19 @@ type API struct {
 	Spec            *OpenAPI
 	MaxBodyBytes    int64
 	ShutdownTimeout time.Duration
+	ETag            bool
+	TLS             *tls.Config
+	OnStart         func(net.Addr)
+	OnStop          func(context.Context)
 
-	Formats map[string]Encoder
-	mux     *http.ServeMux
-	reg     *registry
-	root    *Group
-	mws     []Middleware
-	handler http.Handler
+	Formats  map[string]Encoder
+	Decoders map[string]Decoder
+	Docs     http.Handler
+	mux      *http.ServeMux
+	reg      *registry
+	root     *Group
+	mws      []Middleware
+	handler  http.Handler
 }
 
 func New(title, version string) *API {
@@ -61,24 +75,30 @@ func New(title, version string) *API {
 		MaxBodyBytes:    1 << 20,
 		ShutdownTimeout: 10 * time.Second,
 		Formats:         map[string]Encoder{jsonMIME: json.Marshal},
-		mux:             http.NewServeMux(),
-		reg:             reg,
+		Decoders:        map[string]Decoder{jsonMIME: decodeJSON},
+		Docs: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			io.WriteString(w, docsHTML)
+		}),
+		mux: http.NewServeMux(),
+		reg: reg,
 	}
 	a.root = &Group{api: a}
 	a.rebuild()
-	a.mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, r *http.Request) {
-		b, err := json.MarshalIndent(a.Spec, "", "  ")
-		if err != nil {
-			WriteError(w, err)
-			return
+	serveSpec := func(mime string, render func() ([]byte, error)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			b, err := render()
+			if err != nil {
+				WriteError(w, err)
+				return
+			}
+			w.Header().Set("Content-Type", mime)
+			w.Write(b)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(b)
-	})
-	a.mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, docsHTML)
-	})
+	}
+	a.mux.HandleFunc("GET /openapi.json", serveSpec("application/json", a.SpecJSON))
+	a.mux.HandleFunc("GET /openapi.yaml", serveSpec("application/yaml", a.SpecYAML))
+	a.mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) { a.Docs.ServeHTTP(w, r) })
 	return a
 }
 
@@ -108,29 +128,11 @@ func recoverer(next http.Handler) http.Handler {
 			if v == http.ErrAbortHandler {
 				panic(v)
 			}
-			slog.Error("minato: panic", "panic", v, "method", r.Method, "path", r.URL.Path, "stack", string(debug.Stack()))
+			slog.ErrorContext(r.Context(), "minato: panic", "panic", v, "method", r.Method, "path", r.URL.Path, "stack", string(debug.Stack()))
 			WriteError(w, NewError(http.StatusInternalServerError, ""))
 		}()
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (a *API) Run(ctx context.Context, addr string) error {
-	srv := &http.Server{Addr: addr, Handler: a, ReadHeaderTimeout: 10 * time.Second}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-	}
-	sctx, cancel := context.WithTimeout(context.Background(), a.ShutdownTimeout)
-	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
-		srv.Close()
-		return err
-	}
-	return nil
 }
 
 type Router interface{ scope() *Group }
@@ -174,6 +176,11 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 			panic(fmt.Sprintf("minato: %s %s: error status %d is not 4xx or 5xx", op.Method, op.Path, code))
 		}
 	}
+	for _, rs := range op.Responses {
+		if rs.Status < 100 || rs.Status > 599 {
+			panic(fmt.Sprintf("minato: %s %s: response status %d is not a valid HTTP status", op.Method, op.Path, rs.Status))
+		}
+	}
 	in := api.reg.input(reflect.TypeFor[I](), op.Path)
 	out := api.reg.output(reflect.TypeFor[O]())
 	if op.OperationID == "" {
@@ -184,13 +191,13 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 	if route == "/" {
 		pattern += "{$}"
 	}
-	api.mux.Handle(pattern, chain(g.mws, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api.mux.Handle(pattern, routed(op.Method+" "+op.Path, chain(g.mws, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var mime string
 		var enc Encoder
 		if out.negotiated() {
 			var ok bool
 			if mime, enc, ok = api.negotiate(r.Header.Get("Accept")); !ok {
-				WriteError(w, NewError(http.StatusNotAcceptable, "available: "+strings.Join(slices.Sorted(maps.Keys(api.Formats)), ", ")))
+				writeError(r.Context(), w, NewError(http.StatusNotAcceptable, "available: "+strings.Join(slices.Sorted(maps.Keys(api.Formats)), ", ")))
 				return
 			}
 		}
@@ -203,17 +210,17 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 		}
 		var input I
 		maxBody := cmp.Or(op.MaxBodyBytes, api.MaxBodyBytes)
-		if err := in.bind(api.reg, w, r, reflect.ValueOf(&input).Elem(), maxBody); err != nil {
-			WriteError(w, err)
+		if err := in.bind(api, w, r, reflect.ValueOf(&input).Elem(), maxBody); err != nil {
+			writeError(r.Context(), w, err)
 			return
 		}
 		o, err := handler(r.Context(), &input)
 		if err != nil {
-			WriteError(w, err)
+			writeError(r.Context(), w, err)
 			return
 		}
-		out.write(w, r, reflect.ValueOf(o), op.DefaultStatus, mime, enc, len(api.Formats) > 1)
-	})))
+		out.write(w, r, reflect.ValueOf(o), op.DefaultStatus, mime, enc, len(api.Formats) > 1, api.ETag)
+	}))))
 }
 
 func defaultOperationID(method, path string) string {
@@ -256,13 +263,15 @@ type input struct {
 	form      bool
 	multipart bool
 	formDoc   *Schema
+	hook      bool
+	bodyHook  bool
 }
 
 func (r *registry) input(t reflect.Type, path string) *input {
 	if t.Kind() != reflect.Struct {
 		panic(fmt.Sprintf("minato: input %s must be a struct", t))
 	}
-	in := &input{}
+	in := &input{hook: implementsValidator(t)}
 	for _, f := range reflect.VisibleFields(t) {
 		if f.Anonymous || !f.IsExported() {
 			continue
@@ -270,6 +279,7 @@ func (r *registry) input(t reflect.Type, path string) *input {
 		if f.Name == "Body" {
 			req := f.Type.Kind() != reflect.Pointer && f.Tag.Get("required") != "false"
 			in.body = &field{index: f.Index, required: req, raw: f.Type == bytesType, schema: r.fieldSchema(f)}
+			in.bodyHook = implementsValidator(f.Type)
 			continue
 		}
 		if f.Name == "Form" {
@@ -305,7 +315,8 @@ func (r *registry) input(t reflect.Type, path string) *input {
 
 var scalarTypes = map[string]bool{"string": true, "integer": true, "number": true, "boolean": true}
 
-func (in *input) bind(reg *registry, w http.ResponseWriter, r *http.Request, v reflect.Value, maxBody int64) error {
+func (in *input) bind(api *API, w http.ResponseWriter, r *http.Request, v reflect.Value, maxBody int64) error {
+	reg := api.reg
 	var errs []*ErrorDetail
 	query := r.URL.Query()
 	if in.form {
@@ -390,11 +401,9 @@ func (in *input) bind(reg *registry, w http.ResponseWriter, r *http.Request, v r
 		case in.body.raw:
 			fv.SetBytes(data)
 		default:
-			dec := json.NewDecoder(bytes.NewReader(data))
-			dec.UseNumber()
-			var doc any
-			if err := dec.Decode(&doc); err != nil {
-				return NewError(http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			doc, err := api.decode(r.Header.Get("Content-Type"), data)
+			if err != nil {
+				return NewError(http.StatusBadRequest, "invalid request body: "+err.Error())
 			}
 			n := len(errs)
 			errs = reg.validate(in.body.schema, doc, "body", errs)
@@ -404,6 +413,9 @@ func (in *input) bind(reg *registry, w http.ResponseWriter, r *http.Request, v r
 				}
 			}
 		}
+	}
+	if len(errs) == 0 {
+		errs = in.runValidators(r.Context(), v, errs)
 	}
 	if len(errs) > 0 {
 		return NewError(http.StatusUnprocessableEntity, "validation failed", errs...)
@@ -477,15 +489,9 @@ func (r *registry) output(t reflect.Type) *output {
 		case f.Name == "Status" && f.Type.Kind() == reflect.Int:
 			out.status = f.Index
 		case f.Name == "Body":
-			out.body = &field{index: f.Index}
-			switch f.Type {
-			case bytesType:
-				out.body.raw = true
-			case readerType, readCloserType:
-				out.body.stream = true
-			case sseType:
-				out.body.sse = true
-			default:
+			out.body = r.typeField(f.Type)
+			out.body.index = f.Index
+			if out.body.schema != nil {
 				out.body.schema = r.fieldSchema(f)
 			}
 		case f.Tag.Get("header") != "":
@@ -493,6 +499,18 @@ func (r *registry) output(t reflect.Type) *output {
 		}
 	}
 	return out
+}
+
+func (r *registry) typeField(t reflect.Type) *field {
+	switch t {
+	case bytesType:
+		return &field{raw: true}
+	case readerType, readCloserType:
+		return &field{stream: true}
+	case sseType:
+		return &field{sse: true}
+	}
+	return &field{schema: r.schema(t)}
 }
 
 func (o *output) defaultStatus(def int) int {
@@ -509,7 +527,7 @@ func (o *output) negotiated() bool {
 	return o.body != nil && !o.body.raw && !o.body.stream && !o.body.sse
 }
 
-func (o *output) write(w http.ResponseWriter, r *http.Request, v reflect.Value, def int, mime string, enc Encoder, vary bool) {
+func (o *output) write(w http.ResponseWriter, r *http.Request, v reflect.Value, def int, mime string, enc Encoder, vary, etag bool) {
 	if v.IsNil() {
 		w.WriteHeader(cmp.Or(def, http.StatusNoContent))
 		return
@@ -552,11 +570,22 @@ func (o *output) write(w http.ResponseWriter, r *http.Request, v reflect.Value, 
 	default:
 		b, err := enc(bv.Interface())
 		if err != nil {
-			WriteError(w, err)
+			writeError(r.Context(), w, err)
 			return
 		}
 		if vary {
 			w.Header().Add("Vary", "Accept")
+		}
+		if (etag || w.Header().Get("ETag") != "") && status == http.StatusOK && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			tag := w.Header().Get("ETag")
+			if tag == "" {
+				tag = etagOf(b)
+				w.Header().Set("ETag", tag)
+			}
+			if etagMatches(r.Header.Get("If-None-Match"), tag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 		}
 		setDefault(w, "Content-Type", mime)
 		w.WriteHeader(status)

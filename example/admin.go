@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"crypto/subtle"
-	"net/http"
+	"errors"
 	"os"
-	"strings"
 
 	"github.com/swiftly-headquarters/minato/example/store"
+	"github.com/swiftly-headquarters/minato/middleware"
 	"github.com/swiftly-headquarters/minato/server"
 )
 
@@ -16,23 +16,15 @@ func registerAdmin(api *server.API) {
 	if token == "" {
 		token = "dev-token"
 	}
-	admin := api.Group("/admin", requireToken(token))
+	admin := api.Group("/admin", middleware.Bearer(func(ctx context.Context, got string) (context.Context, error) {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			return nil, errors.New("wrong token")
+		}
+		return ctx, nil
+	}))
 	admin.Tags = []string{"admin"}
 	admin.Security = server.Secured("bearer")
 	server.Get(admin, "/stats", stats, summary("Count users"), errs(401))
-}
-
-func requireToken(want string) server.Middleware {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-				server.WriteError(w, server.Error401("missing or invalid bearer token"))
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
 }
 
 type StatsOutput struct {

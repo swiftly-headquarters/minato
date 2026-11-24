@@ -36,14 +36,16 @@ func Error404(detail string) error                       { return NewError(404, 
 func Error409(detail string) error                       { return NewError(409, detail) }
 func Error422(detail string, errs ...*ErrorDetail) error { return NewError(422, detail, errs...) }
 
-func WriteError(w http.ResponseWriter, err error) {
+func WriteError(w http.ResponseWriter, err error) { writeError(context.Background(), w, err) }
+
+func writeError(ctx context.Context, w http.ResponseWriter, err error) {
 	var em *ErrorModel
 	switch {
 	case errors.As(err, &em):
 	case errors.Is(err, context.DeadlineExceeded):
 		em = NewError(http.StatusServiceUnavailable, "request timed out")
 	default:
-		slog.Error("minato: unhandled error", "err", err)
+		slog.ErrorContext(ctx, "minato: unhandled error", "err", err)
 		em = NewError(http.StatusInternalServerError, "")
 	}
 	b, err := json.Marshal(em)

@@ -38,7 +38,47 @@ jobs:
       - name: Test
         run: |
           go vet ./...
-          go test ./...
+          go test -race ./...
+
+      - name: Check the committed OpenAPI spec is current
+        run: |
+          go run ./example openapi example/openapi.json
+          go run ./example openapi example/openapi.yaml
+          if [ -n "$(git status --porcelain -- example/openapi.json example/openapi.yaml)" ]; then
+            git --no-pager diff -- example/openapi.json example/openapi.yaml
+            echo "::error::example/openapi.json or .yaml is out of date. Run 'go run ./example openapi example/openapi.json' and the same for .yaml, then commit."
+            exit 1
+          fi
+
+      - name: Generate a Go SDK from the spec with takumi and compile it
+        run: |
+          go install github.com/swiftly-headquarters/takumi@v0.1.1
+          takumi -input example/openapi.json -output "$RUNNER_TEMP/sdk" -lang go
+          cd "$RUNNER_TEMP/sdk"
+          go mod init sdkcheck
+          go vet ./...
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Generate a TypeScript SDK, compile it in strict mode and call the example with it
+        run: |
+          ts="$RUNNER_TEMP/ts"
+          mkdir -p "$ts"
+          takumi -input example/openapi.json -output "$ts/sdk" -lang typescript
+          cp tests/sdk/typescript/run.mjs tests/sdk/typescript/tsconfig.json tests/sdk/typescript/package.json "$ts/"
+          (cd "$ts" && npm install --no-audit --no-fund typescript@5 && npx tsc -p tsconfig.json)
+          go build -o "$RUNNER_TEMP/example-ts" ./example
+          ADDR=127.0.0.1:8081 "$RUNNER_TEMP/example-ts" &
+          pid=$!
+          trap 'kill $pid' EXIT
+          for i in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/8081) 2>/dev/null && break
+            sleep 0.2
+          done
+          (cd "$ts" && node run.mjs http://127.0.0.1:8081)
 
   releasing:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
