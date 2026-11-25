@@ -1,7 +1,7 @@
 mode: ContinuousDelivery
 branches:
   main:
-    regex: ^main$
+    regex: ^(main|master)$
     increment: Patch
     is-mainline: true
     is-release-branch: true
