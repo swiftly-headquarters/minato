@@ -81,7 +81,7 @@ jobs:
           (cd "$ts" && node run.mjs http://127.0.0.1:8081)
 
   releasing:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
     needs: [versioning, build]
     runs-on: ubuntu-latest
     env:
