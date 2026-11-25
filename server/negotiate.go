@@ -17,11 +17,21 @@ func (a *API) negotiate(accept string) (string, Encoder, bool) {
 	}
 	best, bestQ := "", 0.0
 	for _, name := range slices.Sorted(maps.Keys(a.Formats)) {
-		if q := acceptQ(accept, name); q > bestQ || (q == bestQ && q > 0 && name == jsonMIME) {
+		if q := acceptQ(accept, name); q > bestQ || (q == bestQ && q > 0 && rank(name) < rank(best)) {
 			best, bestQ = name, q
 		}
 	}
 	return best, a.Formats[best], bestQ > 0
+}
+
+func rank(name string) int {
+	switch name {
+	case jsonMIME:
+		return 0
+	case protoMIME:
+		return 2
+	}
+	return 1
 }
 
 func acceptQ(accept, mt string) float64 {

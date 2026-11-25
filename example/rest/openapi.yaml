@@ -26,6 +26,15 @@ paths:
                     format: "int64"
                 required:
                   - "users"
+            "application/x-protobuf":
+              schema:
+                type: "object"
+                properties:
+                  users:
+                    type: "integer"
+                    format: "int64"
+                required:
+                  - "users"
         "401":
           description: "Unauthorized"
           content:
@@ -118,6 +127,16 @@ paths:
                       - "Hello, world!"
                 required:
                   - "message"
+            "application/x-protobuf":
+              schema:
+                type: "object"
+                properties:
+                  message:
+                    type: "string"
+                    examples:
+                      - "Hello, world!"
+                required:
+                  - "message"
         "422":
           description: "Unprocessable Entity"
           content:
@@ -155,6 +174,21 @@ paths:
           description: "OK"
           content:
             "application/json":
+              schema:
+                type: "object"
+                properties:
+                  bytes:
+                    type: "integer"
+                    format: "int64"
+                  name:
+                    type: "string"
+                  title:
+                    type: "string"
+                required:
+                  - "title"
+                  - "name"
+                  - "bytes"
+            "application/x-protobuf":
               schema:
                 type: "object"
                 properties:
@@ -223,6 +257,9 @@ paths:
             "application/json":
               schema:
                 "$ref": "#/components/schemas/PageBodyUser"
+            "application/x-protobuf":
+              schema:
+                "$ref": "#/components/schemas/PageBodyUser"
         "422":
           description: "Unprocessable Entity"
           content:
@@ -247,6 +284,9 @@ paths:
           "application/json":
             schema:
               "$ref": "#/components/schemas/UserInput"
+          "application/x-protobuf":
+            schema:
+              "$ref": "#/components/schemas/UserInput"
       responses:
         "201":
           description: "Created"
@@ -256,6 +296,9 @@ paths:
                 type: "string"
           content:
             "application/json":
+              schema:
+                "$ref": "#/components/schemas/User"
+            "application/x-protobuf":
               schema:
                 "$ref": "#/components/schemas/User"
         "422":
@@ -325,6 +368,9 @@ paths:
             "application/json":
               schema:
                 "$ref": "#/components/schemas/User"
+            "application/x-protobuf":
+              schema:
+                "$ref": "#/components/schemas/User"
         "404":
           description: "Not Found"
           content:
@@ -362,11 +408,17 @@ paths:
           "application/json":
             schema:
               "$ref": "#/components/schemas/PatchBody"
+          "application/x-protobuf":
+            schema:
+              "$ref": "#/components/schemas/PatchBody"
       responses:
         "200":
           description: "OK"
           content:
             "application/json":
+              schema:
+                "$ref": "#/components/schemas/User"
+            "application/x-protobuf":
               schema:
                 "$ref": "#/components/schemas/User"
         "404":
@@ -410,6 +462,10 @@ components:
           description: "Individual validation problems"
           items:
             "$ref": "#/components/schemas/ErrorDetail"
+        fields:
+          type: "object"
+          description: "The same problems nested by field name, with the messages of each field under _errors"
+          additionalProperties: {}
         status:
           type: "integer"
           format: "int64"

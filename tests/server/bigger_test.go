@@ -306,7 +306,7 @@ func TestContentNegotiation(t *testing.T) {
 	if rec := call(api, "DELETE", "/hi", "", "Accept", "text/html"); rec.Code != 204 {
 		t.Errorf("a route without a body ignores Accept, got %d", rec.Code)
 	}
-	if got := keys(api.Spec.Paths["/hi"]["post"].Responses["200"].Content); !slices.Equal(got, []string{"application/json", "application/xml"}) {
+	if got := keys(api.Spec.Paths["/hi"]["post"].Responses["200"].Content); !slices.Equal(got, []string{"application/json", "application/x-protobuf", "application/xml"}) {
 		t.Errorf("spec content types: %v", got)
 	}
 }

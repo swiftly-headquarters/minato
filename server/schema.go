@@ -52,6 +52,11 @@ type Schema struct {
 	re       *regexp.Regexp
 	nullable bool
 	notNull  bool
+	unsigned bool
+	order    []string
+	nums     map[string]int
+	byNum    map[int]string
+	wire     []string
 }
 
 func (s Schema) MarshalJSON() ([]byte, error) {
@@ -124,6 +129,7 @@ func (r *registry) schema(t reflect.Type) *Schema {
 		return &Schema{}
 	}
 	if s := custom(t); s != nil {
+		numberSchema(s)
 		return s
 	}
 	zero := 0.0
@@ -135,9 +141,9 @@ func (r *registry) schema(t reflect.Type) *Schema {
 	case reflect.Int, reflect.Int64:
 		return &Schema{Type: "integer", Format: "int64"}
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32:
-		return &Schema{Type: "integer", Format: "int32", Minimum: &zero}
+		return &Schema{Type: "integer", Format: "int32", Minimum: &zero, unsigned: true}
 	case reflect.Uint, reflect.Uint64, reflect.Uintptr:
-		return &Schema{Type: "integer", Format: "int64", Minimum: &zero}
+		return &Schema{Type: "integer", Format: "int64", Minimum: &zero, unsigned: true}
 	case reflect.Float32:
 		return &Schema{Type: "number", Format: "float"}
 	case reflect.Float64:
@@ -186,6 +192,8 @@ func (r *registry) uniqueName(t reflect.Type) string {
 
 func (r *registry) object(t reflect.Type) *Schema {
 	s := &Schema{Type: "object", Properties: map[string]*Schema{}}
+	explicit := map[string]int{}
+	defer func() { s.number(explicit) }()
 	for _, f := range reflect.VisibleFields(t) {
 		if !f.IsExported() {
 			continue
@@ -204,6 +212,12 @@ func (r *registry) object(t reflect.Type) *Schema {
 		}
 		if name == "" {
 			name = f.Name
+		}
+		if _, dup := s.Properties[name]; !dup {
+			s.order = append(s.order, name)
+			if n := protoNum(f); n != 0 {
+				explicit[name] = n
+			}
 		}
 		s.Properties[name] = r.fieldSchema(f)
 		_, hasDefault := f.Tag.Lookup("default")
@@ -246,13 +260,18 @@ func applyTags(s *Schema, f reflect.StructField) {
 	if v := tag.Get("doc"); v != "" {
 		s.Description = v
 	}
+	target, et := s, t
+	if s.Type == "array" && s.Items != nil {
+		items := *s.Items
+		target, et, s.Items = &items, t.Elem(), &items
+	}
 	if v := tag.Get("format"); v != "" {
-		s.Format = v
+		target.Format = v
 	}
 	if v := tag.Get("pattern"); v != "" {
 		re, err := regexp.Compile(v)
 		must(err)
-		s.Pattern, s.re = v, re
+		target.Pattern, target.re = v, re
 	}
 	if v, ok := tag.Lookup("default"); ok {
 		x, err := tagValue(t, v)
@@ -265,11 +284,6 @@ func applyTags(s *Schema, f reflect.StructField) {
 		s.Examples = []any{x}
 	}
 	if v := tag.Get("enum"); v != "" {
-		target, et := s, t
-		if s.Type == "array" {
-			items := *s.Items
-			target, et, s.Items = &items, t.Elem(), &items
-		}
 		for _, e := range strings.Split(v, ",") {
 			x, err := tagValue(et, e)
 			must(err)
@@ -277,9 +291,9 @@ func applyTags(s *Schema, f reflect.StructField) {
 		}
 	}
 	for name, dst := range map[string]**float64{
-		"minimum": &s.Minimum, "maximum": &s.Maximum,
-		"exclusiveMinimum": &s.ExclusiveMinimum, "exclusiveMaximum": &s.ExclusiveMaximum,
-		"multipleOf": &s.MultipleOf,
+		"minimum": &target.Minimum, "maximum": &target.Maximum,
+		"exclusiveMinimum": &target.ExclusiveMinimum, "exclusiveMaximum": &target.ExclusiveMaximum,
+		"multipleOf": &target.MultipleOf,
 	} {
 		if v := tag.Get(name); v != "" {
 			x, err := strconv.ParseFloat(v, 64)
@@ -295,7 +309,14 @@ func applyTags(s *Schema, f reflect.StructField) {
 		must(err)
 		s.UniqueItems = b
 	}
-	for name, dst := range map[string]**int{"minLength": &s.MinLength, "maxLength": &s.MaxLength, "minItems": &s.MinItems, "maxItems": &s.MaxItems} {
+	if target.Ref != "" || target.Type == "object" {
+		for _, k := range []string{"format", "pattern", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength"} {
+			if tag.Get(k) != "" {
+				must(fmt.Errorf("%s applies to scalar values, not to structs or maps", k))
+			}
+		}
+	}
+	for name, dst := range map[string]**int{"minLength": &target.MinLength, "maxLength": &target.MaxLength, "minItems": &s.MinItems, "maxItems": &s.MaxItems} {
 		if v := tag.Get(name); v != "" {
 			x, err := strconv.Atoi(v)
 			must(err)
@@ -383,6 +404,19 @@ func canonical(v any) string {
 	return string(b)
 }
 
+const maxValidationErrors = 100
+
+func foldedProperty(s *Schema, k string) (string, bool) {
+	for _, name := range slices.Sorted(maps.Keys(s.Properties)) {
+		if strings.EqualFold(name, k) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func nullItem(s *Schema) bool { return s.nullable || (s.Type == "" && s.Ref == "") }
+
 func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) []*ErrorDetail {
 	if s.Ref != "" {
 		s = r.schemas[strings.TrimPrefix(s.Ref, refPrefix)]
@@ -409,12 +443,18 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 			}
 		}
 		for _, k := range slices.Sorted(maps.Keys(m)) {
+			if len(errs) >= maxValidationErrors {
+				break
+			}
 			ps := s.Properties[k]
 			if ps == nil {
 				ps = s.AdditionalProperties
 			}
 			switch {
 			case ps == nil:
+				if name, ok := foldedProperty(s, k); ok {
+					errs = append(errs, &ErrorDetail{Location: loc + "." + k, Message: fmt.Sprintf("unknown field, did you mean %q? names must match exactly", name)})
+				}
 			case m[k] == nil:
 				if ps.notNull {
 					errs = append(errs, &ErrorDetail{Location: loc + "." + k, Message: "null is not allowed: omit the field, or use server.Nullable"})
@@ -433,16 +473,28 @@ func (r *registry) validate(s *Schema, v any, loc string, errs []*ErrorDetail) [
 			add("expected at least %d items", *s.MinItems)
 		}
 		if s.MaxItems != nil && len(a) > *s.MaxItems {
-			add("expected at most %d items", *s.MaxItems)
+			errs = append(errs, &ErrorDetail{Location: loc, Message: fmt.Sprintf("expected at most %d items", *s.MaxItems)})
+			return errs
 		}
 		for i, x := range a {
-			if x != nil {
-				errs = r.validate(s.Items, x, fmt.Sprintf("%s[%d]", loc, i), errs)
+			if len(errs) >= maxValidationErrors {
+				break
 			}
+			at := fmt.Sprintf("%s[%d]", loc, i)
+			if x == nil {
+				if !nullItem(s.Items) {
+					errs = append(errs, &ErrorDetail{Location: at, Message: "null is not allowed: declare the element type with server.Nullable"})
+				}
+				continue
+			}
+			errs = r.validate(s.Items, x, at, errs)
 		}
 		if s.UniqueItems {
 			seen := map[string]bool{}
 			for i, x := range a {
+				if len(errs) >= maxValidationErrors {
+					break
+				}
 				k := canonical(x)
 				if seen[k] {
 					errs = append(errs, &ErrorDetail{Location: fmt.Sprintf("%s[%d]", loc, i), Message: "duplicate item", Value: x})

@@ -422,7 +422,7 @@ func TestRequestDecoders(t *testing.T) {
 		{"application/x-kv", `{"name":"Ada","count":3}`, 400, "bad pair"},
 		{"application/json", `{"name":"Ada","count":3}`, 200, `"Ada:3"`},
 		{"application/merge-patch+json", `{"name":"Ada","count":3}`, 200, `"Ada:3"`},
-		{"text/plain", `{"name":"Ada","count":3}`, 200, `"Ada:3"`},
+		{"text/plain", `{"name":"Ada","count":3}`, 415, "unsupported"},
 		{"", `{"name":"Ada","count":3}`, 200, `"Ada:3"`},
 	} {
 		var hdr []string
@@ -435,7 +435,7 @@ func TestRequestDecoders(t *testing.T) {
 		}
 	}
 	content := dig(specJSON(t, api), "paths", "/k", "post", "requestBody", "content").(map[string]any)
-	if _, ok := content["application/json"]; !ok || content["application/x-kv"] == nil || len(content) != 2 {
+	if _, ok := content["application/json"]; !ok || content["application/x-kv"] == nil || content["application/x-protobuf"] == nil || len(content) != 3 {
 		t.Errorf("request media types in spec: %v", content)
 	}
 }

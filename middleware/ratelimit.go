@@ -36,8 +36,8 @@ type limiter struct {
 }
 
 func RateLimit(c RateLimitConfig) func(http.Handler) http.Handler {
-	if !(c.Rate > 0) {
-		panic("minato: RateLimit Rate must be above 0")
+	if !(c.Rate > 0) || math.IsInf(c.Rate, 0) {
+		panic("minato: RateLimit Rate must be a finite number above 0")
 	}
 	if c.Burst < 0 {
 		panic("minato: RateLimit Burst must not be negative")
@@ -74,10 +74,14 @@ func (l *limiter) take(key string) (time.Duration, bool) {
 	defer l.mu.Unlock()
 	now := l.now()
 	b := l.buckets[key]
-	if b == nil {
+	if b == nil && len(l.buckets) >= l.maxKeys {
+		l.makeRoom(now)
 		if len(l.buckets) >= l.maxKeys {
-			l.makeRoom(now)
+			key = overflowKey
+			b = l.buckets[key]
 		}
+	}
+	if b == nil {
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	} else {
@@ -95,20 +99,17 @@ func (l *limiter) refilled(b *bucket, now time.Time) float64 {
 	return min(l.burst, b.tokens+max(0, now.Sub(b.last).Seconds())*l.rate)
 }
 
+const overflowKey = "\x00overflow"
+
 func (l *limiter) makeRoom(now time.Time) {
-	if now.Sub(l.lastSweep) >= time.Second {
-		l.lastSweep = now
-		for k, b := range l.buckets {
-			if l.refilled(b, now) >= l.burst {
-				delete(l.buckets, k)
-			}
-		}
+	if now.Sub(l.lastSweep) < time.Second {
+		return
 	}
-	for k := range l.buckets {
-		if len(l.buckets) < l.maxKeys {
-			return
+	l.lastSweep = now
+	for k, b := range l.buckets {
+		if l.refilled(b, now) >= l.burst {
+			delete(l.buckets, k)
 		}
-		delete(l.buckets, k)
 	}
 }
 
@@ -116,6 +117,9 @@ func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
+	}
+	if host == "" {
+		return "unknown"
 	}
 	ip, err := netip.ParseAddr(host)
 	if err != nil {

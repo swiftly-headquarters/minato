@@ -1,2 +1,2 @@
-example/openapi.json text eol=lf
-example/openapi.yaml text eol=lf
+example/rest/openapi.json text eol=lf
+example/rest/openapi.yaml text eol=lf

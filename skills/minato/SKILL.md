@@ -1,6 +1,6 @@
 ---
 name: minato
-description: Write and change HTTP endpoints with minato, a Go app server framework where each route is a typed function and its input and output structs define binding, validation and the OpenAPI 3.1 document. Covers path, query, header and cookie params, JSON bodies, custom validation hooks, PATCH with optional and nullable fields, other request body formats, several response types per route, form and file uploads, streaming and server-sent events, response formats, groups, middleware (logging, CORS, gzip, timeouts), security, serving static files, a single-page app or a reverse proxy to a dev server, writing the OpenAPI spec to a file or checking it in CI, generating SDKs from it with takumi, running over TLS or a unix socket with start and stop hooks, in-process API tests, request IDs, bearer auth, rate limiting, health checks, Prometheus metrics, ETags. Use when a Go project imports github.com/swiftly-headquarters/minato/server, middleware, web or servertest, or when asked to add or edit an endpoint, request or response type, validation rule, upload, stream, error response or API spec in such a project.
+description: Write and change HTTP and gRPC endpoints with minato, a Go app server framework where each route is a typed function and its input and output structs define binding, validation and the OpenAPI 3.1 document. Covers path, query, header and cookie params, JSON bodies, custom validation hooks, PATCH with optional and nullable fields, other request body formats, several response types per route, form and file uploads, streaming and server-sent events, response formats, protobuf request and response bodies, unary gRPC with a generated .proto and clients, validation errors nested by field, groups, middleware (logging, CORS, gzip, timeouts), security, serving static files, a single-page app or a reverse proxy to a dev server, writing the OpenAPI spec to a file or checking it in CI, generating SDKs from it with takumi, running over TLS or a unix socket with start and stop hooks, in-process API tests, request IDs, bearer auth, rate limiting, health checks, Prometheus metrics, ETags. Use when a Go project imports github.com/swiftly-headquarters/minato/server, middleware, web or servertest, or when asked to add or edit an endpoint, request or response type, validation rule, upload, stream, error response, gRPC method, protobuf message or API spec in such a project.
 ---
 
 # minato
@@ -96,7 +96,64 @@ type UploadInput struct {
 
 `api.Formats` maps lower-case media types to `func(any) ([]byte, error)`, JSON by default. Add to it before registering routes so the spec lists them: `api.Formats["application/xml"] = xml.Marshal` (use `xml:` tags on the body types). The `Accept` header picks the best match by q-value (JSON wins ties); no match returns 406 before the handler runs. Errors are always `application/problem+json`.
 
-Request bodies: JSON is built in, and a missing or unknown `Content-Type` (including `application/merge-patch+json`) is treated as JSON. `api.Decoders["application/yaml"] = func(b []byte) (any, error)` adds a type, chosen by `Content-Type`; set it before registering routes so the spec lists it. The decoder must return a generic value (string-keyed maps, slices, strings, numbers, bools), because the result is validated and bound like JSON. Formats that can't (XML) belong in a handler with a `[]byte` body.
+Request bodies: JSON is built in, and a missing `Content-Type` is read as JSON, and a type that is neither JSON, `+json` (such as `application/merge-patch+json`) nor registered in `Decoders` is a 415. `api.Decoders["application/yaml"] = func(b []byte) (any, error)` adds a type, chosen by `Content-Type`; set it before registering routes so the spec lists it. The decoder must return a generic value (string-keyed maps, slices, strings, numbers, bools), because the result is validated and bound like JSON. Formats that can't (XML) belong in a handler with a `[]byte` body.
+
+## Protobuf and gRPC
+
+No dependency, no codegen on the server: messages come from the same structs and tags as the spec. Verified with `protoc` 3.21, `grpcurl` 1.9 and grpc-go 1.72.
+
+**To expose an API over gRPC**
+
+1. `api.GRPCService = "acme.users.v1.Users"` before registering routes (default `minato.API`). It is part of every call, so pick a versioned name and keep it.
+2. Run it normally. `Run`/`Serve` accept HTTP/1.1 and cleartext HTTP/2 (h2c) on one port; with `api.TLS` HTTP/2 is negotiated. `api.DisableGRPC = true` turns gRPC and h2c off.
+3. `curl -s localhost:8080/api.proto -o api.proto` (or `api.ProtoFile()`). It is generated from the routes. There is no reflection, so tools need this file.
+4. Before publishing, pin field numbers (below), then commit `api.proto` and fail CI when it changes.
+5. Call it: `grpcurl -plaintext -proto api.proto -H 'authorization: Bearer T' -d '{"name":"Ada"}' localhost:8080 acme.users.v1.Users/GetHello` (drop `-plaintext` for TLS), or generate a client.
+
+**Go client** (`go install google.golang.org/protobuf/cmd/protoc-gen-go@latest google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`; the file has no `go_package`, so map it):
+
+```bash
+protoc --go_out=. --go_opt=Mapi.proto=example.com/app/pb --go_opt=module=example.com/app \
+       --go-grpc_out=. --go-grpc_opt=Mapi.proto=example.com/app/pb --go-grpc_opt=module=example.com/app api.proto
+```
+
+```go
+conn, _ := grpc.NewClient("localhost:8080", grpc.WithTransportCredentials(insecure.NewCredentials()))
+client := pb.NewUsersClient(conn)
+ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer T") // metadata = request headers
+res, err := client.GetUsersById(ctx, &pb.GetUsersByIdRequest{Id: proto.Int64(5)}) // optional fields are pointers
+status.Code(err), status.Convert(err).Message()
+```
+
+**Routes become methods.** `/users/{id}` with `OperationID` `get-users-by-id` (the default) is `GetUsersById`. Request message: one field per `path`/`query`/`header`/`cookie` param (named as the param, invalid characters become `_`, so `X-Trace` is `X_Trace`, with a `json_name`) plus `body`. Response message: one field per `header` output field plus `body`. Two routes with the same method name panic at registration; set `o.OperationID`. Multipart forms, `io.Reader` bodies and SSE are not exposed; `[]byte` bodies are `bytes`. Identifiers are ASCII only: other letters in an `OperationID` act as word breaks.
+
+**A call is an ordinary request** through middleware, `Security` schemes, validation and the handler. Metadata becomes headers (`authorization`, `idempotency-key`, `x-request-id`; `-bin` keys, `content-type`, `te`, `accept`, `accept-encoding` and `grpc-*` are not forwarded). `grpc-timeout` is the context deadline (overflowing values are ignored). Request gzip is accepted, responses are not compressed. One message per call, limited to `MaxBodyBytes` before and after decompression.
+
+**Status codes:** 400/406/415/422 InvalidArgument, 401 Unauthenticated, 403 PermissionDenied, 404 NotFound, 409 Aborted, 412 and other 4xx FailedPrecondition, 413/429 ResourceExhausted, 408/504/expired deadline DeadlineExceeded, client cancel Cancelled, 501 Unimplemented, 502/503 Unavailable, other 5xx Internal. `grpc-message` is the problem `detail` followed by the validation problems (`body.email: expected format email`). Unknown service or method is Unimplemented.
+
+**Codecs:** `application/grpc` and `application/grpc+proto` are protobuf. `application/grpc+json` is JSON with the REST names; it also accepts `protojson` style (64-bit integers as strings, omitted zeros). From grpc-go register a codec named `json` and use `grpc.CallContentSubtype("json")`. No gRPC-Web.
+
+**Protobuf over REST:** `Content-Type: application/x-protobuf` (also `application/protobuf`, `application/vnd.google.protobuf`) and `Accept: application/x-protobuf`; only the `Body` is protobuf, params stay HTTP. The message is the type of the `body` field in `api.proto`: `curl -s -H 'Accept: application/x-protobuf' host/hello | protoc --decode=pkg.GetHelloResponseBody api.proto`, and `protoc --encode=pkg.UserInput api.proto < in.txt` for requests. Errors stay problem+json. Ties in `Accept` go to JSON, then your own formats, then protobuf. Turn off with `delete(api.Formats, "application/x-protobuf")` and the same on `api.Decoders`.
+
+**Field numbers** follow struct field order from 1, names are the `json` tag names. Reordering renumbers, so before publishing pin them with a `proto:"1"` tag on the field (for example `json:"name" proto:"1"`); the same tag on `path`/`query`/`header` input fields and on `Body` pins the numbers in the gRPC request and response messages. Valid: 1 to 536870911 except 19000-19999; duplicates panic. Untagged fields take the lowest free number. Never change or reuse the number of a published field.
+
+**Types:** string, bool, int32/int64 (`int` is 64-bit), uint32/uint64, float/double, `[]byte` as bytes, struct as message, slices as `repeated` (packed numbers), `map[string]T`, `time.Time` and other string types as string; `any`, `json.RawMessage` and custom schemas as `bytes` holding JSON text. Pointer, `Optional`, `Nullable`, `default` or `omitempty` make a scalar `optional` (presence kept); a missing required scalar is zero and the tags still check it; a missing required message fails; `null` is "not sent". A non-object body is wrapped as `{value = 1}`. Unknown fields are skipped, a wrong wire type is a 400, repeated singular messages merge, bytes equal the official canonical encoding. **Not representable:** lists of lists and maps of lists or maps; protobuf then answers 406/415 on REST, the method is left out of `api.proto` and works only as `application/grpc+json`.
+
+**Testing:** `servertest` is REST only. For gRPC, `go api.Serve(ctx, ln)` on `127.0.0.1:0` and `grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))`.
+
+**Behind a proxy:** gRPC needs HTTP/2 end to end (nginx `grpc_pass`, Envoy HTTP/2 upstream); not run here. Give `RateLimit` a `Key` function, since the connection address is the proxy.
+
+| You see | Fix |
+| --- | --- |
+| grpcurl: `server does not support the reflection API` | pass `-proto api.proto` |
+| `Unimplemented: unknown method` | service is `api.GRPCService`, method is the CamelCase `OperationID`; compare with `/api.proto` |
+| `Unimplemented: protobuf is not available for this method` | the route has a list of lists or similar: change the type or use `application/grpc+json` |
+| `InvalidArgument: invalid request message` | client built from another `api.proto`: regenerate, pin numbers |
+| `Unauthenticated` but REST works | send the credential as metadata (`authorization`), not in the message |
+| cannot connect, HTTP/1.1 only | `api.DisableGRPC` is true, or a proxy downgrades to HTTP/1.1 |
+| REST protobuf gives 406/415 | the body type is not representable, or protobuf was removed from `Formats`/`Decoders` |
+
+Not supported: streaming RPCs, reflection, the health service, response compression, gRPC-Web.
 
 ## Several response types
 
@@ -112,11 +169,11 @@ A type whose JSON form differs from its Go shape implements `server.Schemer` (`S
 
 - `multipleOf` must be above 0 (else registration panics). `uniqueItems:"true"` compares numbers by value (`1` equals `1.0`) and reports the later duplicate's index.
 
-- `enum:"a,b"` is a comma list; on a slice it constrains the items.
+- `enum:"a,b"` is a comma list. On a slice, `enum`, `minimum`/`maximum`, `minLength`/`maxLength`, `pattern` and `format` constrain each item, while `minItems`/`maxItems`/`uniqueItems` constrain the slice. A `null` item is a 422 unless the element type is `server.Nullable`. A JSON key that differs from a field name only in case is a 422.
 - Body object fields are required unless they are pointers, `omitempty`/`omitzero`, have a `default`, or set `required:"false"`. `required:"true"` forces it.
 - Defaults are filled in before the handler runs.
 - `format` is documented in OpenAPI and, for strings, enforced for `email` (a bare address, no display name), `uuid`, `date-time` (RFC 3339), `date`, `uri` (needs a scheme), `ipv4`, `ipv6` and `byte` (base64; automatic for `[]byte`). Any other format is documentation only: add `pattern` to enforce it.
-- Invalid input returns 422 with every problem listed; bad JSON returns 400; oversized body returns 413 (`api.MaxBodyBytes`, default 1 MiB).
+- Invalid input returns 422 with the problems listed (at most 100; an array over `maxItems` is not echoed back); bad JSON, or anything after the JSON value, returns 400; a number with spaces around it in a query, header or cookie is a 422; oversized body returns 413 (`api.MaxBodyBytes`, default 1 MiB).
 - Statuses minato sends on its own: 406 (no registered format matches `Accept`, checked before the handler runs), 415 (form route, other content type), 503 (`middleware.Timeout` fired), 413, 422, 400.
 
 ## Custom validation
@@ -141,6 +198,8 @@ They are never required, tags apply to `T`, and `null` for an `Optional` is a 42
 ## Errors
 
 Return `server.Error400/401/403/404/409/422(detail)` or `server.NewError(status, detail, details...)`. They produce an RFC 9457 `application/problem+json` response. Any other error becomes an opaque 500 (logged via `slog`, message not sent to the client), so wrap expected failures in these helpers. A panic in a handler or middleware is recovered the same way (logged with a stack, 500 to the client).
+
+A 422 lists every problem at once (max 100) twice: `errors` is a flat list of `{location, message, value}` and `fields` nests the messages by input shape like Discord does (`fields.body.items["1"].qty._errors[0].message`; array indexes are keys, request-level problems are under a top-level `_errors`). `NewError(status, detail, details...)` fills `fields` from the details' `Location` strings (`body.a.b[0]`). `Validate` hooks run only after the tag checks pass.
 
 The spec documents a generic `default` error response. To list specific statuses per route, set `o.Errors = []int{404, 409}` (4xx/5xx only, otherwise registration panics). A 422 is added to the spec automatically for any route with params, a body or a `Validate` hook, so don't list 422 yourself. In middleware, reject with `server.WriteError(w, server.Error401("..."))` so the response matches the rest of the API.
 
@@ -176,7 +235,7 @@ Typical order (first = outermost): `api.Use(middleware.RequestID(ids), middlewar
 - **`RequestID(RequestIDConfig{Header, Generate, IgnoreIncoming})`**: every request gets an ID, set as `X-Request-ID` (or `Header`) on the response and on the request headers (so `web.Proxy` forwards it), and stored in the context: `middleware.RequestIDFromContext(ctx)`. Default is 32 random hex chars (`middleware.NewRequestID()`). A custom generator is `Generate: func(r *http.Request) string { return "api-" + middleware.NewRequestID() }`; an empty return falls back to the default. A valid incoming ID (1-128 printable ASCII, no spaces) is kept unless `IgnoreIncoming`; anything else is replaced. Put it first so `Logger` and everything after sees the ID. `Logger` adds `request_id` itself, and minato's unhandled-error and panic logs include it.
 - **`SlogContext(handler)`**: wraps a slog handler so records logged with a request context (`slog.InfoContext(ctx, ...)`) get `request_id`. `slog.SetDefault(slog.New(middleware.SlogContext(slog.NewJSONHandler(os.Stdout, nil))))`. Never wrap `slog.Default().Handler()` (deadlock).
 - **`Bearer(verify func(ctx, token) (context.Context, error))`**: enforces `Authorization: Bearer`. No or malformed header: 401 with `WWW-Authenticate: Bearer`. Ordinary error from `verify`: 401 `invalid_token` without details. Return a `*server.ErrorModel` (`server.Error403(...)`, `server.NewError(503, ...)`) to choose the response. Return a derived context to pass the user to handlers. Use on a group; pair it with `Security = server.Secured("bearer")` so the spec says the same. Compare secrets with `crypto/subtle`. `Bearer(nil)` panics.
-- **`RateLimit(RateLimitConfig{Rate, Burst, Key, MaxKeys, Now})`**: in-memory token bucket per client, 429 problem with `Retry-After`. `Rate` (per second, above 0, else panic) and `Burst` (default `ceil(Rate)`). Default key is the connecting address with IPv6 grouped by /64; behind a proxy supply `Key` (the real client address), and return `""` to exempt a request. Per process, bounded by `MaxKeys` (10000). Place it after `CORS`.
+- **`RateLimit(RateLimitConfig{Rate, Burst, Key, MaxKeys, Now})`**: in-memory token bucket per client, 429 problem with `Retry-After`. `Rate` (per second, above 0, else panic) and `Burst` (default `ceil(Rate)`). Default key is the connecting address with IPv6 grouped by /64; behind a proxy supply `Key` (the real client address), and return `""` to exempt a request. Per process, bounded by `MaxKeys` (10000): fully refilled clients are dropped first, and clients past the limit share one overflow bucket, so churning addresses can't reset a limited client. An address with no host shares the key `unknown`. `Rate` must be finite. Place it after `CORS`.
 - **`NewMetrics()`**: `m.Middleware()` records, `server.Handle(api, "GET /metrics", m)` serves Prometheus text: `http_requests_total{method,route,status}`, `http_request_duration_seconds`, `http_requests_in_flight`. `route` is the registered pattern; requests that reached no route (404, 405, or rejected by middleware that runs earlier, like `RateLimit`) are `unrouted`; unusual methods are `OTHER`. Protect `/metrics` if the server is public.
 - **Health** (package `web`): `server.Handle(api, "GET /healthz", web.Live())` and `server.Handle(api, "GET /readyz", web.Ready(timeout, map[string]web.Check{"db": func(ctx) error {...}}))`. Checks run concurrently; 503 if any fails, panics or times out; the body only says `ok`/`failed`/`timeout` per check (errors are logged, not sent).
 - **ETag**: `api.ETag = true` gives negotiated 200 GET/HEAD responses a weak `ETag` and answers `If-None-Match` with an empty 304 (the handler still runs). A handler-provided `header:"ETag"` output field is used instead and honoured even when `api.ETag` is off. Streams, raw bodies, errors and other statuses are untouched.
@@ -194,11 +253,11 @@ server.Handle(api, "/", h)
 ```
 
 - `"/"` is the catch-all: typed routes, `/openapi.json` and `/docs` win because the mux prefers the most specific pattern. Put the API under routes that are real patterns, not under the catch-all. Registering two handlers for the same pattern panics.
-- `Static`: no directory listings, dotfiles are 404 (except `.well-known`), `index.html` is always `Cache-Control: no-cache`, Range works, only GET/HEAD (405 otherwise). `Immutable` is a prefix inside the FS (`"/assets/"`) for content-hashed files only.
+- `Static`: no directory listings, dotfiles are 404 (except `.well-known`, and Windows 8.3 names like `ENV~1` are 404 too), `index.html` is always `Cache-Control: no-cache`, Range works, only GET/HEAD (405 otherwise). `Immutable` is a prefix inside the FS (`"/assets/"`) for content-hashed files only; it matches whole path segments. Every file is sent with `X-Content-Type-Options: nosniff`. To serve a folder from disk use `web.Dir("./dist")` (rooted, does not follow links out of the folder), never `os.DirFS`, which follows symlinks and Windows junctions.
 - `SPA: true` falls back to `index.html` only for GET/HEAD requests with `Accept: text/html` and no file extension. A `fetch` to an unknown `/api/x` or a missing `/x.js` is still a 404, so don't expect curl without an Accept header to see the fallback.
 - A subtree mount needs `http.StripPrefix`: `server.Handle(api, "/static/", http.StripPrefix("/static", web.Static(fsys, web.Config{})))`. The handler otherwise sees the full path, group prefix included.
-- `Proxy` replaces client `X-Forwarded-*`/`Forwarded` headers, proxies WebSocket upgrades (HMR), prepends the target's path, and returns a 502 problem if the upstream is down. Keep `middleware.Timeout` off routes that proxy WebSockets or streams.
-- Switching embedded build vs dev proxy on an env var (see `example/web.go`) is the usual pattern. `go:embed` needs the build directory to exist when compiling.
+- `Proxy` replaces client `X-Forwarded-*`/`Forwarded` headers, proxies WebSocket upgrades (HMR), prepends the target's path, and returns a 502 problem if the upstream is down or sends no headers within 30 s; a request target that isn't a plain path gets a 400. Keep `middleware.Timeout` off routes that proxy WebSockets or streams.
+- Switching embedded build vs dev proxy on an env var (see `example/rest/web.go`) is the usual pattern. `go:embed` needs the build directory to exist when compiling.
 
 ## Security
 
@@ -218,15 +277,16 @@ admin.Security = server.Secured("bearer")      // or o.Security = server.Secured
 
 - Registered with `AddScheme`, the scheme is enforced on every route that names it, after group middleware and before binding. A plain error from `Verify` is a generic 401 with `Challenge` as `WWW-Authenticate`; a `*server.ErrorModel` (for example `server.Error403`) is sent as is.
 - Alternatives are OR-ed (`[]map[string][]string{{"bearer": nil}, {"key": nil}}`); schemes in one alternative are AND-ed.
+- `AddScheme` needs a `Verify` (panics otherwise). An OR list that mixes an enforced alternative with a documentation-only or empty one panics at registration, since it would open the route. `server.Handle` on a group enforces the group's `Security`. `api.Spec.Security` applies to routes and mounts that set none of their own (set it before registering routes); `o.Security = []map[string][]string{}` opts out.
 - Registered only with `BearerAuth`, a scheme is documentation and not enforced. An unregistered name panics at registration, so register schemes before the routes that use them.
 - Secured routes document a 401.
 
 ## Security headers, idempotency, pagination, readiness, tracing
 
 - `api.Use(middleware.SecureHeaders(middleware.SecureHeadersConfig{}))`: nosniff, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. `ContentSecurityPolicy` and `HSTSMaxAge` are opt-in (a CSP like `default-src 'none'` breaks pages that load scripts, such as `/docs` or a SPA).
-- `api.Use(middleware.Idempotency(middleware.IdempotencyConfig{}))`: POST/PATCH with `Idempotency-Key` replay the first final response (marked `Idempotent-Replayed: true`); same key with a different method, path, body or `Authorization` is 422; a duplicate while the first runs is 409. 5xx and 401/403/408/425/429 are not stored so they can be retried. `TTL` (24 h) is how long a response is kept, `LockTTL` (5 min) how long an unfinished request holds its key. The default store is in-memory; for several instances implement `middleware.IdempotencyStore`:
-  - `Begin(ctx, key, fingerprint, ttl) (existing *IdempotencyEntry, claimed bool, err error)` is one atomic step (Redis `SET NX PX`, unique insert): a free key stores a pending entry for `ttl` and returns `nil, true, nil`; a taken key returns a copy and `false`. Exactly one of N concurrent callers may claim. An error here makes the middleware answer 503 without running the handler.
-  - `Finish(ctx, key, entry, ttl)` replaces the pending entry with the final one for `ttl` (the response TTL). `Release(ctx, key)` deletes it and is not an error for an unknown key. Their errors are only logged, and their context is not cancelled when the client hangs up.
+- `api.Use(middleware.Idempotency(middleware.IdempotencyConfig{}))`: POST/PATCH with `Idempotency-Key` replay the first final response (marked `Idempotent-Replayed: true`); keys are scoped per caller (hash of `Authorization`, `Cookie` and `Host`, override with `IdempotencyConfig.Scope`), so another user never gets your replay or blocks your key; same caller and key with a different method, path, body or `Accept-Encoding` is 422; a replay never copies `Set-Cookie`, `Vary`, `X-Request-Id`, `Access-Control-*` or headers set by outer middleware; a duplicate while the first runs is 409. 5xx and 401/403/408/425/429 are not stored so they can be retried. `TTL` (24 h) is how long a response is kept, `LockTTL` (5 min) how long an unfinished request holds its key; keep it above your longest request, since a longer handler can be started again. The default store is in-memory (at most 10000 keys and 32 MiB of responses; it evicts finished entries only, and answers 503 when full of unfinished ones); for several instances implement `middleware.IdempotencyStore`:
+  - `Begin(ctx, key, fingerprint, ttl) (existing *IdempotencyEntry, claim string, err error)` is one atomic step (Redis `SET NX PX`, unique insert): a free key stores a pending entry for `ttl` and returns `nil`, a non-empty `claim` token and no error; a taken key returns a copy and an empty claim. Exactly one of N concurrent callers gets a claim. An error here makes the middleware answer 503 without running the handler.
+  - `Finish(ctx, key, claim, entry, ttl)` replaces the pending entry with the final one for `ttl` (the response TTL). `Release(ctx, key, claim)` deletes it and is not an error for an unknown key. Both do nothing unless `claim` still owns the key, so an expired owner can't overwrite a newer result. Their errors are only logged, and their context is not cancelled when the client hangs up.
   - Return copies, never "key exists" as an error, and let pending entries expire by themselves. Test with `idempotencytest.Run(t, func(t *testing.T) middleware.IdempotencyStore { return newStore(t) })`, each call returning an empty store.
 - Pagination: embed `server.Page` in the input (`limit`, default 20, max 100; `cursor`), return `server.PageBody[T]`, and build it with `server.Paginate(rows, in.Limit, func(x T) any { return x.ID })` after fetching `in.Limit+1` rows. Decode incoming cursors with `server.DecodeCursor`, and on failure return `server.InvalidCursor(err)` (a 422 on `query.cursor`). Cursors are opaque; the next cursor is absent on the last page.
 - `api.ShutdownDelay = 5 * time.Second` keeps serving after shutdown starts so a load balancer can drain. `server.Handle(api, "GET /readyz", web.ReadyFor(api, timeout, checks))` answers 503 `draining` from the moment shutdown starts. HTTP timeouts default to header 10 s, read 1 min, idle 2 min, write none (streams); raise `ReadTimeout` for big uploads.
@@ -240,11 +300,11 @@ Without starting a server: `api.WriteSpec("openapi.yaml")` (`.yaml`/`.yml` give 
 
 ## Running
 
-`api.Run(ctx, addr)` serves until `ctx` is done. `addr` is `":8080"`, or `"unix:/run/app.sock"` for a unix socket (a stale socket file from a crash is replaced; a live socket or a regular file at that path is an error). `api.Serve(ctx, ln)` takes your own listener (port 0 in tests, systemd sockets). Set `api.TLS = &tls.Config{Certificates: ...}` (or `GetCertificate`) before running to serve HTTPS with HTTP/2; a config with no certificate makes it return an error. `api.OnStart = func(net.Addr)` runs after the listener is bound and before requests are served; `api.OnStop = func(context.Context)` runs after in-flight requests finished or `ShutdownTimeout` passed (the context has its own `ShutdownTimeout` deadline), and also if the server fails after starting, but not if binding failed. Use `OnStop` to close databases.
+`api.Run(ctx, addr)` serves until `ctx` is done. Without `api.TLS` it also accepts cleartext HTTP/2 (h2c) on the same port, which gRPC clients use (`api.DisableGRPC = true` turns that off). `addr` is `":8080"`, or `"unix:/run/app.sock"` for a unix socket (a stale socket file from a crash is replaced; a live socket or a regular file at that path is an error). `api.Serve(ctx, ln)` takes your own listener (port 0 in tests, systemd sockets). Set `api.TLS = &tls.Config{Certificates: ...}` (or `GetCertificate`) before running to serve HTTPS with HTTP/2; a config with no certificate makes it return an error. `api.OnStart = func(net.Addr)` runs after the listener is bound and before requests are served; `api.OnStop = func(context.Context)` runs after in-flight requests finished or `ShutdownTimeout` passed (the context has its own `ShutdownTimeout` deadline), and also if the server fails after starting, but not if binding failed. Use `OnStop` to close databases.
 
 ## Not supported (don't invent it)
 
-Security schemes beyond a `Verify` hook (OAuth flows, scope checks beyond what `Verify` does, token issuance), request bodies that can't decode to a generic value (XML) besides JSON, forms and `Decoders`, validation hooks on types nested below `Body`, a hard request timeout (`Timeout` is cooperative), transports other than HTTP.
+Security schemes beyond a `Verify` hook (OAuth flows, scope checks beyond what `Verify` does, token issuance), request bodies that can't decode to a generic value (XML) besides JSON, forms and `Decoders`, validation hooks on types nested below `Body`, a hard request timeout (`Timeout` is cooperative), transports other than HTTP and unary gRPC.
 
 ## Testing
 

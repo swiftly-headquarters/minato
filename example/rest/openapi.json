@@ -39,6 +39,20 @@
                     "users"
                   ]
                 }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "users": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  },
+                  "required": [
+                    "users"
+                  ]
+                }
               }
             }
           },
@@ -187,6 +201,22 @@
                     "message"
                   ]
                 }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "examples": [
+                        "Hello, world!"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "message"
+                  ]
+                }
               }
             }
           },
@@ -246,6 +276,28 @@
             "description": "OK",
             "content": {
               "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "bytes": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "title",
+                    "name",
+                    "bytes"
+                  ]
+                }
+              },
+              "application/x-protobuf": {
                 "schema": {
                   "type": "object",
                   "properties": {
@@ -351,6 +403,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/PageBodyUser"
                 }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "$ref": "#/components/schemas/PageBodyUser"
+                }
               }
             }
           },
@@ -390,6 +447,11 @@
               "schema": {
                 "$ref": "#/components/schemas/UserInput"
               }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "$ref": "#/components/schemas/UserInput"
+              }
             }
           }
         },
@@ -405,6 +467,11 @@
             },
             "content": {
               "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              },
+              "application/x-protobuf": {
                 "schema": {
                   "$ref": "#/components/schemas/User"
                 }
@@ -515,6 +582,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/User"
                 }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
               }
             }
           },
@@ -575,6 +647,11 @@
               "schema": {
                 "$ref": "#/components/schemas/PatchBody"
               }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchBody"
+              }
             }
           }
         },
@@ -583,6 +660,11 @@
             "description": "OK",
             "content": {
               "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              },
+              "application/x-protobuf": {
                 "schema": {
                   "$ref": "#/components/schemas/User"
                 }
@@ -653,6 +735,11 @@
             "items": {
               "$ref": "#/components/schemas/ErrorDetail"
             }
+          },
+          "fields": {
+            "type": "object",
+            "description": "The same problems nested by field name, with the messages of each field under _errors",
+            "additionalProperties": {}
           },
           "status": {
             "type": "integer",

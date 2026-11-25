@@ -141,7 +141,7 @@ func TestGzip(t *testing.T) {
 
 	rec := do(api, "GET", "/text", "Accept-Encoding", "gzip, br")
 	if rec.Header().Get("Content-Encoding") != "gzip" || rec.Header().Get("Content-Type") != "application/json" ||
-		!strings.Contains(rec.Header().Get("Vary"), "Accept-Encoding") || gunzip(t, rec.Body.Bytes()) != plain {
+		!strings.Contains(strings.Join(rec.Header().Values("Vary"), ","), "Accept-Encoding") || gunzip(t, rec.Body.Bytes()) != plain {
 		t.Fatalf("compressed response wrong: %v", rec.Header())
 	}
 	if rec.Body.Len() >= len(plain) {

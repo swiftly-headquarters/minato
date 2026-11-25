@@ -183,13 +183,23 @@ func TestRateLimitConcurrent(t *testing.T) {
 func TestRateLimitBoundedKeys(t *testing.T) {
 	clk := newClock()
 	h := limited(middleware.RateLimitConfig{Rate: 1, Burst: 1, MaxKeys: 3, Now: clk.Now})
-	for i := range 200 {
-		if rec := hit(h, fmt.Sprintf("10.0.%d.%d:1", i/250, i%250)); rec.Code != 204 {
-			t.Fatalf("a new client always gets its first request, even at the key limit: %d (client %d)", rec.Code, i)
+	for i := range 3 {
+		if rec := hit(h, fmt.Sprintf("10.0.0.%d:1", i)); rec.Code != 204 {
+			t.Fatalf("clients within the key limit get their first request: %d (client %d)", rec.Code, i)
 		}
-		if i%50 == 49 {
-			clk.Advance(time.Minute)
+	}
+	admitted := 0
+	for i := 3; i < 50; i++ {
+		if hit(h, fmt.Sprintf("10.0.1.%d:1", i)).Code == 204 {
+			admitted++
 		}
+	}
+	if admitted != 1 {
+		t.Fatalf("clients beyond the key limit share one overflow bucket, so one second admits one request: %d", admitted)
+	}
+	clk.Advance(time.Minute)
+	if rec := hit(h, "10.0.2.1:1"); rec.Code != 204 {
+		t.Fatalf("refilled buckets make room for a new client: %d", rec.Code)
 	}
 }
 

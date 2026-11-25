@@ -1,2 +1,8 @@
 out/
 *.exe
+
+# local security audit fuzzing and reproducers
+/tests/fuzz/
+/tests/fuzzmw/
+/tests/fuzzweb/
+/AUDIT_FINDINGS.md

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -59,16 +60,20 @@ type API struct {
 	OnStart           func(net.Addr)
 	OnStop            func(context.Context)
 
-	Formats  map[string]Encoder
-	Decoders map[string]Decoder
-	Docs     http.Handler
-	mux      *http.ServeMux
-	reg      *registry
-	root     *Group
-	mws      []Middleware
-	handler  http.Handler
-	draining atomic.Bool
-	schemes  map[string]Scheme
+	GRPCService string
+	DisableGRPC bool
+
+	Formats     map[string]Encoder
+	Decoders    map[string]Decoder
+	Docs        http.Handler
+	mux         *http.ServeMux
+	reg         *registry
+	root        *Group
+	mws         []Middleware
+	handler     http.Handler
+	draining    atomic.Bool
+	schemes     map[string]Scheme
+	grpcMethods map[string]*grpcMethod
 }
 
 func (a *API) Draining() bool { return a.draining.Load() }
@@ -87,9 +92,11 @@ func New(title, version string) *API {
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Minute,
 		IdleTimeout:       2 * time.Minute,
-		Formats:           map[string]Encoder{jsonMIME: json.Marshal},
-		Decoders:          map[string]Decoder{jsonMIME: decodeJSON},
+		GRPCService:       "minato.API",
+		Formats:           map[string]Encoder{jsonMIME: json.Marshal, protoMIME: protoNeedsSchema},
+		Decoders:          map[string]Decoder{jsonMIME: decodeJSON, protoMIME: protoNeedsSchemaDecoder},
 		schemes:           map[string]Scheme{},
+		grpcMethods:       map[string]*grpcMethod{},
 		Docs: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			io.WriteString(w, docsHTML)
@@ -113,10 +120,20 @@ func New(title, version string) *API {
 	a.mux.HandleFunc("GET /openapi.json", serveSpec("application/json", a.SpecJSON))
 	a.mux.HandleFunc("GET /openapi.yaml", serveSpec("application/yaml", a.SpecYAML))
 	a.mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) { a.Docs.ServeHTTP(w, r) })
+	a.mux.HandleFunc("GET /api.proto", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		io.WriteString(w, a.ProtoFile())
+	})
 	return a
 }
 
-func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.handler.ServeHTTP(w, r) }
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !a.DisableGRPC && isGRPC(r) {
+		a.serveGRPC(w, r)
+		return
+	}
+	a.handler.ServeHTTP(w, r)
+}
 
 func (a *API) Use(mws ...Middleware) {
 	a.mws = append(a.mws, mws...)
@@ -185,6 +202,9 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 	if op.Security == nil {
 		op.Security = g.Security
 	}
+	if op.Security == nil {
+		op.Security = api.Spec.Security
+	}
 	for _, code := range op.Errors {
 		if code < 400 || code > 599 {
 			panic(fmt.Sprintf("minato: %s %s: error status %d is not 4xx or 5xx", op.Method, op.Path, code))
@@ -195,19 +215,14 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 			panic(fmt.Sprintf("minato: %s %s: response status %d is not a valid HTTP status", op.Method, op.Path, rs.Status))
 		}
 	}
-	for _, req := range op.Security {
-		for name := range req {
-			if !api.knownScheme(name) {
-				panic(fmt.Sprintf("minato: %s %s: security scheme %q is not registered (call AddScheme or BearerAuth first)", op.Method, op.Path, name))
-			}
-		}
-	}
+	api.checkSecurity(op.Method+" "+op.Path, op.Security)
 	in := api.reg.input(reflect.TypeFor[I](), op.Path)
 	out := api.reg.output(reflect.TypeFor[O]())
 	if op.OperationID == "" {
 		op.OperationID = defaultOperationID(op.Method, op.Path)
 	}
 	api.document(op, in, out)
+	api.addGRPC(op, in, out)
 	pattern := op.Method + " " + op.Path
 	if route == "/" {
 		pattern += "{$}"
@@ -220,6 +235,13 @@ func Register[I, O any](r Router, op Operation, handler func(context.Context, *I
 			if mime, enc, ok = api.negotiate(r.Header.Get("Accept")); !ok {
 				writeError(r.Context(), w, NewError(http.StatusNotAcceptable, "available: "+strings.Join(slices.Sorted(maps.Keys(api.Formats)), ", ")))
 				return
+			}
+			if mime == protoMIME {
+				if out.body.protoErr != nil {
+					writeError(r.Context(), w, NewError(http.StatusNotAcceptable, "protobuf is not available for this response: "+out.body.protoErr.Error()))
+					return
+				}
+				enc = api.protoEncoder(out.body.schema)
 			}
 		}
 		if in.form {
@@ -261,6 +283,7 @@ var bytesType = reflect.TypeFor[[]byte]()
 
 type param struct {
 	in, name string
+	num      int
 	index    []int
 	required bool
 	def      string
@@ -271,6 +294,8 @@ type param struct {
 
 type field struct {
 	index    []int
+	num      int
+	protoErr error
 	required bool
 	raw      bool
 	stream   bool
@@ -299,7 +324,10 @@ func (r *registry) input(t reflect.Type, path string) *input {
 		}
 		if f.Name == "Body" {
 			req := f.Type.Kind() != reflect.Pointer && f.Tag.Get("required") != "false"
-			in.body = &field{index: f.Index, required: req, raw: f.Type == bytesType, schema: r.fieldSchema(f)}
+			in.body = &field{index: f.Index, num: protoNum(f), required: req, raw: f.Type == bytesType, schema: r.fieldSchema(f)}
+			if !in.body.raw {
+				in.body.protoErr = r.protoSupport(in.body.schema, "body")
+			}
 			in.bodyHook = implementsValidator(f.Type)
 			continue
 		}
@@ -312,7 +340,7 @@ func (r *registry) input(t reflect.Type, path string) *input {
 			if name == "" {
 				continue
 			}
-			p := param{in: loc, name: name, index: f.Index, schema: r.fieldSchema(f)}
+			p := param{in: loc, name: name, num: protoNum(f), index: f.Index, schema: r.fieldSchema(f)}
 			p.required = loc == "path" || f.Tag.Get("required") == "true"
 			p.def, p.hasDef = f.Tag.Lookup("default")
 			typ := p.schema.Type
@@ -414,16 +442,23 @@ func (in *input) bind(api *API, w http.ResponseWriter, r *http.Request, v reflec
 			return NewError(http.StatusBadRequest, "reading body: "+err.Error())
 		}
 		fv := v.FieldByIndex(in.body.index)
+		mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		switch {
-		case len(data) == 0:
+		case len(data) == 0 && !(isProtoMIME(mt) && !in.body.raw):
 			if in.body.required {
 				errs = append(errs, &ErrorDetail{Location: "body", Message: "required"})
 			}
 		case in.body.raw:
 			fv.SetBytes(data)
 		default:
-			doc, err := api.decode(r.Header.Get("Content-Type"), data)
+			if isProtoMIME(mt) && in.body.protoErr != nil {
+				return NewError(http.StatusUnsupportedMediaType, "protobuf is not available for this request: "+in.body.protoErr.Error())
+			}
+			doc, err := api.decode(r.Header.Get("Content-Type"), data, in.body.schema)
 			if err != nil {
+				if errors.Is(err, errUnsupportedMedia) {
+					return NewError(http.StatusUnsupportedMediaType, "unsupported request Content-Type, send application/json or application/x-protobuf")
+				}
 				return NewError(http.StatusBadRequest, "invalid request body: "+err.Error())
 			}
 			n := len(errs)
@@ -465,7 +500,7 @@ func scalarValue(typ, x string) (any, error) {
 	switch typ {
 	case "integer", "number":
 		var f float64
-		if json.Unmarshal([]byte(x), &f) != nil {
+		if x != strings.TrimSpace(x) || json.Unmarshal([]byte(x), &f) != nil {
 			return nil, fmt.Errorf("expected %s", typ)
 		}
 		return json.Number(x), nil
@@ -489,6 +524,7 @@ func setJSON(fv reflect.Value, val any) error {
 
 type header struct {
 	index  []int
+	num    int
 	name   string
 	schema *Schema
 }
@@ -512,11 +548,13 @@ func (r *registry) output(t reflect.Type) *output {
 		case f.Name == "Body":
 			out.body = r.typeField(f.Type)
 			out.body.index = f.Index
+			out.body.num = protoNum(f)
 			if out.body.schema != nil {
 				out.body.schema = r.fieldSchema(f)
+				out.body.protoErr = r.protoSupport(out.body.schema, "body")
 			}
 		case f.Tag.Get("header") != "":
-			out.headers = append(out.headers, header{f.Index, f.Tag.Get("header"), r.fieldSchema(f)})
+			out.headers = append(out.headers, header{index: f.Index, name: f.Tag.Get("header"), num: protoNum(f), schema: r.fieldSchema(f)})
 		}
 	}
 	return out

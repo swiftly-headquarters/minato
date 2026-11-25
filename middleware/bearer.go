@@ -25,7 +25,7 @@ func Bearer(verify func(ctx context.Context, token string) (context.Context, err
 			ctx, err := verify(r.Context(), token)
 			if err != nil {
 				var em *server.ErrorModel
-				if !errors.As(err, &em) {
+				if !errors.As(err, &em) || em == nil {
 					em = server.NewError(http.StatusUnauthorized, "invalid bearer token")
 				}
 				if em.Status == http.StatusUnauthorized {

@@ -36,6 +36,11 @@ func (a *API) Serve(ctx context.Context, ln net.Listener) error {
 		WriteTimeout:      a.WriteTimeout,
 		IdleTimeout:       a.IdleTimeout,
 	}
+	if a.TLS == nil && !a.DisableGRPC {
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		srv.Protocols.SetUnencryptedHTTP2(true)
+	}
 	errc := make(chan error, 1)
 	go func() {
 		if a.TLS != nil {

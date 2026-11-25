@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -16,9 +16,10 @@ import (
 	"github.com/swiftly-headquarters/minato/server"
 )
 
-func main() {
+func New() (*server.API, *middleware.Metrics) {
 	api := server.New("Minato Example", "1.0.0")
 	api.Spec.Servers = []server.Server{{URL: "http://localhost:8080"}}
+	api.GRPCService = "minato.example.v1.Example"
 	slog.SetDefault(slog.New(middleware.SlogContext(slog.NewTextHandler(os.Stderr, nil))))
 	ids := middleware.RequestIDConfig{}
 	if prefix := os.Getenv("REQUEST_ID_PREFIX"); prefix != "" {
@@ -36,32 +37,15 @@ func main() {
 		middleware.Idempotency(middleware.IdempotencyConfig{}),
 		middleware.Gzip(),
 	)
-	if os.Getenv("OFFLINE_DOCS") != "" {
-		api.Docs = api.OfflineDocs()
-	}
 
 	server.Get(api, "/hello", hello, summary("Greet the caller"))
 	server.Get(api, "/files/{path...}", getFile, summary("Echo the requested path (catch-all demo)"))
 	registerUsers(api)
 	registerAdmin(api)
-	registerExtras(api)
-	registerOps(api, metrics)
-	registerWeb(api)
+	return api, metrics
+}
 
-	if len(os.Args) > 1 && os.Args[1] == "openapi" {
-		if len(os.Args) > 2 {
-			if err := api.WriteSpec(os.Args[2]); err != nil {
-				log.Fatal(err)
-			}
-			return
-		}
-		b, err := api.SpecJSON()
-		if err != nil {
-			log.Fatal(err)
-		}
-		os.Stdout.Write(b)
-		return
-	}
+func Run(api *server.API) {
 	if cert, key := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"); cert != "" {
 		pair, err := tls.LoadX509KeyPair(cert, key)
 		if err != nil {
@@ -69,7 +53,7 @@ func main() {
 		}
 		api.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
 	}
-	api.OnStart = func(addr net.Addr) { log.Printf("listening on %s, docs at /docs", addr) }
+	api.OnStart = func(addr net.Addr) { log.Printf("listening on %s", addr) }
 	api.OnStop = func(context.Context) { log.Println("stopped") }
 	addr := os.Getenv("ADDR")
 	if addr == "" {

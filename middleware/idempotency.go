@@ -2,14 +2,18 @@ package middleware
 
 import (
 	"bytes"
+	"container/list"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,67 +28,152 @@ type IdempotencyEntry struct {
 	Body        []byte
 }
 
+var (
+	ErrStoreFull = errors.New("idempotency store is full of unfinished requests")
+	ErrTooLarge  = errors.New("response is larger than the idempotency store's byte limit")
+)
+
 type IdempotencyStore interface {
-	Begin(ctx context.Context, key, fingerprint string, ttl time.Duration) (existing *IdempotencyEntry, claimed bool, err error)
-	Finish(ctx context.Context, key string, e IdempotencyEntry, ttl time.Duration) error
-	Release(ctx context.Context, key string) error
+	Begin(ctx context.Context, key, fingerprint string, ttl time.Duration) (existing *IdempotencyEntry, claim string, err error)
+	Finish(ctx context.Context, key, claim string, e IdempotencyEntry, ttl time.Duration) error
+	Release(ctx context.Context, key, claim string) error
 }
 
 type memEntry struct {
 	IdempotencyEntry
+	claim   string
 	expires time.Time
+	size    int64
+	elem    *list.Element
 }
 
 type MemoryIdempotency struct {
+	MaxEntries int
+	MaxBytes   int64
+
 	mu        sync.Mutex
 	entries   map[string]*memEntry
+	order     *list.List
+	bytes     int64
 	lastSweep time.Time
-	now       func() time.Time
+	Now       func() time.Time
 }
 
 func NewMemoryIdempotency() *MemoryIdempotency {
-	return &MemoryIdempotency{entries: map[string]*memEntry{}, now: time.Now}
+	return &MemoryIdempotency{MaxEntries: 10000, MaxBytes: 32 << 20, entries: map[string]*memEntry{}, order: list.New(), Now: time.Now}
 }
 
-func (m *MemoryIdempotency) sweep(now time.Time) {
-	if now.Sub(m.lastSweep) < time.Minute {
+func (m *MemoryIdempotency) remove(key string) {
+	e, ok := m.entries[key]
+	if !ok {
 		return
 	}
-	m.lastSweep = now
+	m.order.Remove(e.elem)
+	m.bytes -= e.size
+	delete(m.entries, key)
+}
+
+func (m *MemoryIdempotency) put(key string, e *memEntry) {
+	m.remove(key)
+	e.elem = m.order.PushBack(key)
+	m.entries[key] = e
+	m.bytes += e.size
+}
+
+func (m *MemoryIdempotency) evictOldest() bool {
+	for el := m.order.Front(); el != nil; el = el.Next() {
+		key := el.Value.(string)
+		if m.entries[key].claim == "" {
+			m.remove(key)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MemoryIdempotency) expire(now time.Time) {
 	for k, e := range m.entries {
-		if now.After(e.expires) {
-			delete(m.entries, k)
+		if !now.Before(e.expires) {
+			m.remove(k)
 		}
 	}
 }
 
-func (m *MemoryIdempotency) Begin(_ context.Context, key, fingerprint string, ttl time.Duration) (*IdempotencyEntry, bool, error) {
+func (m *MemoryIdempotency) Begin(_ context.Context, key, fingerprint string, ttl time.Duration) (*IdempotencyEntry, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := m.now()
-	m.sweep(now)
+	now := m.Now()
+	if now.Sub(m.lastSweep) >= time.Minute {
+		m.lastSweep = now
+		m.expire(now)
+	}
 	if e, ok := m.entries[key]; ok && now.Before(e.expires) {
 		cp := e.IdempotencyEntry.clone()
-		return &cp, false, nil
+		return &cp, "", nil
 	}
-	m.entries[key] = &memEntry{IdempotencyEntry: IdempotencyEntry{Fingerprint: fingerprint}, expires: now.Add(ttl)}
-	return nil, true, nil
+	if len(m.entries) >= m.MaxEntries {
+		m.expire(now)
+	}
+	for len(m.entries) >= m.MaxEntries {
+		if !m.evictOldest() {
+			return nil, "", ErrStoreFull
+		}
+	}
+	claim, err := newClaim()
+	if err != nil {
+		return nil, "", err
+	}
+	m.put(key, &memEntry{IdempotencyEntry: IdempotencyEntry{Fingerprint: fingerprint}, claim: claim, expires: now.Add(ttl)})
+	return nil, claim, nil
 }
 
-func (m *MemoryIdempotency) Finish(_ context.Context, key string, e IdempotencyEntry, ttl time.Duration) error {
+func (m *MemoryIdempotency) Finish(_ context.Context, key, claim string, e IdempotencyEntry, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if cur, ok := m.entries[key]; !ok || claim == "" || cur.claim != claim {
+		return nil
+	}
 	e = e.clone()
 	e.Done = true
-	m.entries[key] = &memEntry{IdempotencyEntry: e, expires: m.now().Add(ttl)}
+	ne := &memEntry{IdempotencyEntry: e, expires: m.Now().Add(ttl), size: entrySize(e)}
+	m.remove(key)
+	if ne.size > m.MaxBytes {
+		return ErrTooLarge
+	}
+	for m.bytes+ne.size > m.MaxBytes {
+		if !m.evictOldest() {
+			return ErrStoreFull
+		}
+	}
+	m.put(key, ne)
 	return nil
 }
 
-func (m *MemoryIdempotency) Release(_ context.Context, key string) error {
+func (m *MemoryIdempotency) Release(_ context.Context, key, claim string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.entries, key)
+	if cur, ok := m.entries[key]; ok && claim != "" && cur.claim == claim {
+		m.remove(key)
+	}
 	return nil
+}
+
+func newClaim() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func entrySize(e IdempotencyEntry) int64 {
+	n := int64(len(e.Fingerprint) + len(e.Body))
+	for k, vs := range e.Header {
+		for _, v := range vs {
+			n += int64(len(k) + len(v))
+		}
+	}
+	return n
 }
 
 type IdempotencyConfig struct {
@@ -94,9 +183,44 @@ type IdempotencyConfig struct {
 	LockTTL time.Duration
 	MaxBody int64
 	Methods []string
+	Scope   func(*http.Request) string
 }
 
 const maxCachedBody = 1 << 20
+
+func defaultScope(r *http.Request) string {
+	return digest(r.Header.Get("Authorization"), r.Header.Get("Cookie"), r.Host)
+}
+
+func digest(parts ...string) string {
+	sum := sha256.New()
+	var n [8]byte
+	for _, p := range parts {
+		binary.BigEndian.PutUint64(n[:], uint64(len(p)))
+		sum.Write(n[:])
+		sum.Write([]byte(p))
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func notReplayed(k string) bool {
+	switch k {
+	case "Set-Cookie", "Vary", "X-Request-Id", "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	}
+	return strings.HasPrefix(k, "Access-Control-")
+}
+
+func ownHeaders(before, after http.Header) http.Header {
+	own := http.Header{}
+	for k, vs := range after {
+		if notReplayed(k) || slices.Equal(before[k], vs) {
+			continue
+		}
+		own[k] = slices.Clone(vs)
+	}
+	return own
+}
 
 func Idempotency(c IdempotencyConfig) func(http.Handler) http.Handler {
 	if c.Store == nil {
@@ -110,6 +234,9 @@ func Idempotency(c IdempotencyConfig) func(http.Handler) http.Handler {
 	}
 	if c.LockTTL <= 0 {
 		c.LockTTL = 5 * time.Minute
+	}
+	if c.Scope == nil {
+		c.Scope = defaultScope
 	}
 	if c.MaxBody <= 0 {
 		c.MaxBody = 1 << 20
@@ -139,18 +266,20 @@ func Idempotency(c IdempotencyConfig) func(http.Handler) http.Handler {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			sum := sha256.New()
-			sum.Write([]byte(r.Method + " " + r.URL.RequestURI() + "\n" + r.Header.Get("Authorization") + "\n"))
-			sum.Write(body)
-			fp := hex.EncodeToString(sum.Sum(nil))
+			fp := digest(r.Method, r.URL.RequestURI(), r.Header.Get("Accept-Encoding"), string(body))
+			storeKey := digest(c.Scope(r)) + ":" + key
+			before := w.Header().Clone()
 
-			existing, claimed, err := c.Store.Begin(r.Context(), key, fp, c.LockTTL)
+			existing, claim, err := c.Store.Begin(r.Context(), storeKey, fp, c.LockTTL)
+			if err == nil && existing == nil && claim == "" {
+				err = errors.New("store returned neither a claim nor an entry")
+			}
 			if err != nil {
 				slog.ErrorContext(r.Context(), "minato: idempotency store failed", "op", "begin", "err", err)
 				server.WriteError(w, server.NewError(http.StatusServiceUnavailable, "idempotency store unavailable"))
 				return
 			}
-			if !claimed {
+			if existing != nil {
 				switch {
 				case existing.Fingerprint != fp:
 					server.WriteError(w, server.Error422("idempotency key was already used for a different request"))
@@ -164,7 +293,7 @@ func Idempotency(c IdempotencyConfig) func(http.Handler) http.Handler {
 
 			ctx := context.WithoutCancel(r.Context())
 			release := func() {
-				if err := c.Store.Release(ctx, key); err != nil {
+				if err := c.Store.Release(ctx, storeKey, claim); err != nil {
 					slog.ErrorContext(ctx, "minato: idempotency store failed", "op", "release", "err", err)
 				}
 			}
@@ -185,8 +314,8 @@ func Idempotency(c IdempotencyConfig) func(http.Handler) http.Handler {
 				release()
 				return
 			}
-			entry := IdempotencyEntry{Fingerprint: fp, Status: status, Header: rec.header, Body: rec.body.Bytes()}
-			if err := c.Store.Finish(ctx, key, entry, c.TTL); err != nil {
+			entry := IdempotencyEntry{Fingerprint: fp, Status: status, Header: ownHeaders(before, rec.header), Body: rec.body.Bytes()}
+			if err := c.Store.Finish(ctx, storeKey, claim, entry, c.TTL); err != nil {
 				slog.ErrorContext(ctx, "minato: idempotency store failed", "op", "finish", "err", err)
 			}
 		})

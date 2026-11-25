@@ -55,10 +55,6 @@ func secureAPI() *server.API {
 	})
 	server.Get(api, "/admin", func(ctx context.Context, _ *empty) (*empty, error) { return nil, nil },
 		func(o *server.Operation) { o.Security = server.Secured("key", "admin") })
-	server.Get(api, "/either", func(ctx context.Context, _ *empty) (*empty, error) { return nil, nil },
-		func(o *server.Operation) {
-			o.Security = []map[string][]string{{"docs-only": nil}, {"key": nil}}
-		})
 	server.Get(api, "/open-docs-only", func(ctx context.Context, _ *empty) (*empty, error) { return nil, nil },
 		func(o *server.Operation) { o.Security = server.Secured("docs-only") })
 	return api
@@ -94,11 +90,8 @@ func TestSchemeScopesAndForbidden(t *testing.T) {
 	}
 }
 
-func TestSchemeAlternativesAndDocOnlySchemes(t *testing.T) {
+func TestDocOnlySchemesAreNotEnforced(t *testing.T) {
 	api := secureAPI()
-	if rec := call(api, "GET", "/either", ""); rec.Code != 204 {
-		t.Fatalf("a documentation-only alternative passes without enforcement: %d", rec.Code)
-	}
 	if rec := call(api, "GET", "/open-docs-only", ""); rec.Code != 204 {
 		t.Fatalf("a documentation-only scheme does not enforce: %d", rec.Code)
 	}
@@ -288,5 +281,51 @@ func TestPagedRouteWithCursorValidation(t *testing.T) {
 	}
 	if dig(spec, "components", "schemas", "PageBodypageItem") == nil {
 		t.Fatal("the generic instance is a named component")
+	}
+}
+
+func TestDocOnlyAlternativeNextToAnEnforcedOneIsAStartupPanic(t *testing.T) {
+	api := secureAPI()
+	noop := func(ctx context.Context, _ *empty) (*empty, error) { return nil, nil }
+	mustPanic(t, "a documentation-only alternative beside an enforced one", func() {
+		server.Get(api, "/either", noop, func(o *server.Operation) {
+			o.Security = []map[string][]string{{"docs-only": nil}, {"key": nil}}
+		})
+	})
+	mustPanic(t, "an empty alternative beside an enforced one", func() {
+		server.Get(api, "/either2", noop, func(o *server.Operation) {
+			o.Security = []map[string][]string{{}, {"key": nil}}
+		})
+	})
+	server.Get(api, "/both", noop, func(o *server.Operation) {
+		o.Security = []map[string][]string{{"key": nil, "docs-only": nil}}
+	})
+	if rec := call(api, "GET", "/both", ""); rec.Code != 401 {
+		t.Fatalf("an enforced scheme AND-ed with a documented one still enforces: %d", rec.Code)
+	}
+}
+
+func TestSchemeWithoutVerifyIsAStartupPanic(t *testing.T) {
+	api := server.New("t", "1")
+	mustPanic(t, "AddScheme without Verify", func() {
+		api.AddScheme("key", server.Scheme{Spec: map[string]any{"type": "apiKey", "in": "header", "name": "X-Key"}})
+	})
+}
+
+func TestHandleOnASecuredGroupIsEnforced(t *testing.T) {
+	api := server.New("t", "1")
+	keyScheme(api)
+	admin := api.Group("/admin")
+	admin.Security = server.Secured("key")
+	server.Handle(admin, "GET /export", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("all user data")) }))
+	if rec := call(api, "GET", "/admin/export", ""); rec.Code != 401 || strings.Contains(rec.Body.String(), "all user data") {
+		t.Fatalf("no key: %d %s", rec.Code, rec.Body)
+	}
+	if rec := call(api, "GET", "/admin/export", "", "X-Key", "k1"); rec.Code != 200 {
+		t.Fatalf("valid key: %d", rec.Code)
+	}
+	server.Handle(api, "GET /public", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("hi")) }))
+	if rec := call(api, "GET", "/public", ""); rec.Code != 200 {
+		t.Fatalf("an unsecured scope stays open: %d", rec.Code)
 	}
 }

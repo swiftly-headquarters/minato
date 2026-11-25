@@ -5,7 +5,10 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"path"
+	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/swiftly-headquarters/minato/server"
@@ -17,7 +20,12 @@ type Config struct {
 	Immutable string
 }
 
-func Static(fsys fs.FS, c Config) http.Handler { return &static{fsys, c} }
+func Static(fsys fs.FS, c Config) http.Handler {
+	if c.Immutable != "" && !strings.HasSuffix(c.Immutable, "/") {
+		c.Immutable += "/"
+	}
+	return &static{fsys, c}
+}
 
 type static struct {
 	fs fs.FS
@@ -87,8 +95,9 @@ func (s *static) serve(w http.ResponseWriter, r *http.Request, name string) {
 		rs = bytes.NewReader(b)
 	}
 	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
 	switch {
-	case path.Base(name) == "index.html":
+	case strings.EqualFold(path.Base(name), "index.html"):
 		h.Set("Cache-Control", "no-cache")
 	case s.c.Immutable != "" && strings.HasPrefix("/"+name, s.c.Immutable):
 		h.Set("Cache-Control", "public, max-age=31536000, immutable")
@@ -96,13 +105,33 @@ func (s *static) serve(w http.ResponseWriter, r *http.Request, name string) {
 	http.ServeContent(w, r, name, info.ModTime(), rs)
 }
 
+var shortNameRE = regexp.MustCompile(`^[^.]{1,6}~[0-9]{1,6}(\.[^.]{0,3})?$`)
+
 func hidden(name string) bool {
 	for seg := range strings.SplitSeq(name, "/") {
 		if strings.HasPrefix(seg, ".") && seg != "." && seg != ".well-known" {
 			return true
 		}
+		if runtime.GOOS == "windows" && shortNameRE.MatchString(seg) {
+			return true
+		}
 	}
 	return false
 }
+
+type DirFS struct {
+	fs.FS
+	root *os.Root
+}
+
+func Dir(dir string) *DirFS {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		panic("minato: web.Dir: " + err.Error())
+	}
+	return &DirFS{root.FS(), root}
+}
+
+func (d *DirFS) Close() error { return d.root.Close() }
 
 func notFound(w http.ResponseWriter) { server.WriteError(w, server.Error404("not found")) }

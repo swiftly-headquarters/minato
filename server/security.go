@@ -15,6 +15,9 @@ type Scheme struct {
 }
 
 func (a *API) AddScheme(name string, s Scheme) {
+	if s.Verify == nil {
+		panic(fmt.Sprintf("minato: AddScheme %q needs a Verify function (use BearerAuth for a scheme that is only documented)", name))
+	}
 	a.schemes[name] = s
 	if s.Spec != nil {
 		if a.Spec.Components.SecuritySchemes == nil {
@@ -39,6 +42,29 @@ func (a *API) knownScheme(name string) bool {
 	}
 	_, ok := a.Spec.Components.SecuritySchemes[name]
 	return ok
+}
+
+func (a *API) checkSecurity(where string, reqs []map[string][]string) {
+	enforced, open := false, false
+	for _, req := range reqs {
+		alt := false
+		for name := range req {
+			if !a.knownScheme(name) {
+				panic(fmt.Sprintf("minato: %s: security scheme %q is not registered (call AddScheme or BearerAuth first)", where, name))
+			}
+			if _, ok := a.schemes[name]; ok {
+				alt = true
+			}
+		}
+		if alt {
+			enforced = true
+		} else {
+			open = true
+		}
+	}
+	if enforced && open {
+		panic(fmt.Sprintf("minato: %s: an alternative made only of documentation-only schemes (or empty) would let every request through next to an enforced one", where))
+	}
 }
 
 func (a *API) enforce(reqs []map[string][]string, next http.Handler) http.Handler {

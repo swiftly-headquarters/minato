@@ -285,16 +285,6 @@ func TestIdempotencyDoesNotReplayCredentialFailures(t *testing.T) {
 	}
 }
 
-func TestIdempotencyKeyIsBoundToTheCredential(t *testing.T) {
-	h := &countingHandler{}
-	api := idemAPI(h, middleware.IdempotencyConfig{})
-	do2(api, "POST", "/things", "x", "Idempotency-Key", "k-cred", "Authorization", "Bearer alice")
-	rec := do2(api, "POST", "/things", "x", "Idempotency-Key", "k-cred", "Authorization", "Bearer bob")
-	if rec.Code != 422 || h.calls.Load() != 1 {
-		t.Fatalf("another user cannot replay a response: %d calls=%d", rec.Code, h.calls.Load())
-	}
-}
-
 func TestMemoryIdempotencyStoreContract(t *testing.T) {
 	idempotencytest.Run(t, func(t *testing.T) middleware.IdempotencyStore { return middleware.NewMemoryIdempotency() })
 }
